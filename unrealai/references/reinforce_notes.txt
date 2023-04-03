@@ -1,0 +1,1 @@
+gymnasium- colleciton of environments, typically gamelike with rules
