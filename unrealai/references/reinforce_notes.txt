@@ -32,9 +32,12 @@ value function.
 2. The Replay Memory allows the agent to learn from past experiences by randomly sampling a batch
 of experiences from the memory buffer, rather than just learning from the most recent experience.
 This helps to reduce the correlation between subsequent experiences, which can improve the
-stability and convergence of the learning algorithm. In addition, by storing experiences in a buffer, the agent can re-use past experiences to update its policy and value function multiple times, which can further improve learning efficiency.
+stability and convergence of the learning algorithm. In addition, by storing experiences in a buffer,
+the agent can re-use past experiences to update its policy and value function multiple times,
+which can further improve learning efficiency.
 3. The Replay Memory is typically implemented as a fixed-size buffer or queue that stores the most
 recent experiences. When the buffer is full, new experiences overwrite the oldest experiences in the
 buffer. During training, a batch of experiences is randomly sampled from the buffer and used to
 update the agent's policy and value function. This process is repeated iteratively until the agent
 converges to an optimal policy.
+
