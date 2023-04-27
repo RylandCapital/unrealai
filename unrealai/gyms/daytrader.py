@@ -5,6 +5,7 @@ import time
 import tensorflow as tf
 import random
 from collections import deque
+import gc
 
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, Dropout
@@ -49,7 +50,7 @@ class Trader:
         self.treward = 0
         self.performance = 1
         self.trade_penalty = .001
-        self.min_performance = .90
+        self.min_performance = .99
         self.current_position = 0
         # self.observation_space = observation_space(
         #     len(self._prepare_data().columns)
@@ -204,7 +205,7 @@ class DQNAgent:
         self.epsilon = 1.0
         self.epsilon_min = 0.01
         self.epsilon_decay = 0.999
-        self.learning_rate = 0.005
+        self.learning_rate = 0.001
         self.model = self._build_model()
 
     def _build_model(self):
@@ -222,21 +223,44 @@ class DQNAgent:
     def act(self, state):
         if np.random.rand() <= self.epsilon:
             return random.randrange(self.action_size)
-        act_values = self.model.predict(state)
-        return np.argmax(act_values[0])
-
+        else:
+            act_values = self.model.predict(state)
+            return np.argmax(act_values[0])
+        
     def replay(self, batch_size):
         minibatch = random.sample(self.memory, batch_size)
-        for state, action, reward, next_state, done in minibatch:
+        states = np.array([state for state, _, _, _, _ in minibatch]).reshape(-1, self.state_size)
+        next_states = np.array([next_state for _, _, _, next_state, _ in minibatch]).reshape(-1, self.state_size)
+
+        targets = self.model.predict(states)
+        next_state_preds = self.model.predict(next_states)
+        
+        for i, (_, action, reward, _, done) in enumerate(minibatch):
             target = reward
             if not done:
-                target = reward + self.gamma * np.amax(self.model.predict(next_state)[0])
-            target_f = self.model.predict(state)
-            target_f[0][action] = target
-            self.model.fit(state, target_f, epochs=1, verbose=0)
+                target = reward + self.gamma * np.amax(next_state_preds[i])
+            targets[i][action] = target
+
+        self.model.train_on_batch(states, targets)
 
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
+
+    # def replay(self, batch_size):
+    #     minibatch = random.sample(self.memory, batch_size)
+    #     for state, action, reward, next_state, done in minibatch:
+    #         target = reward
+    #         if not done:
+    #             target = reward + self.gamma * np.amax(self.model.predict(next_state)[0])
+    #         target_f = self.model.predict(state)
+    #         target_f[0][action] = target
+    #         self.model.fit(state, target_f, epochs=1, verbose=0)
+            
+
+    #     if self.epsilon > self.epsilon_min:
+    #         self.epsilon *= self.epsilon_decay
+        
+       
 
     def analyze_training(self, plot='score_avg', average=10):
         self.history['score_avg'] = self.history['score'].rolling(average).mean()
@@ -249,10 +273,10 @@ if __name__ == "__main__":
     env = Trader('AAPL', '2023-02-02','2023-04-01', '5m', .5)
     state_size = 16
     action_size = env.action_space.n
-    max_mem = 100
+    max_mem = 1000
     agent = DQNAgent(state_size, action_size, max_mem)
     episodes = 125
-    batch_size = 16
+    batch_size = 64
 
     for e in np.arange(episodes):
         state = env.reset()
