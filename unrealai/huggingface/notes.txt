@@ -1,0 +1,44 @@
+'''huggingface notes'''
+#I think I want to fine tune a pre trained model
+
+
+# encoders, decoders, and encoder-decoders
+
+    # BERT is the most popular ENCODER
+        # bi directional, self-attention two main aspects
+        # encoder takes words and outputs a numerical sequence of numbers for EACH WORD
+        # this is called a feature vector or feature tensor
+        # the vector is contexulized, the 768 number vector takes into account the position of the word (self attention)
+        # a words feature vector representation is affected by the other words around it
+        # encoders are great one their own, especially for masked language modeling, sequence sentiment
+
+    #GPT-2 is a decoder (only)
+        # almost same thing as an encoder but 
+        # it uses MASKED self-attention
+        # only words to the LEFT of the words affect that words feature/tensor vector
+        # because they only have left context they are really good at text GENERATION
+        # decoders are auto regressive, so, as a new word is predicted from the current vectors it will be added to get the another word
+
+    #T5 is a popular encoder-decoder 
+        # the encoder passes the feature vectors to the decoder as an input (alongside the usual word sequence input, so 2 inputs)
+
+# what happens inside the pipeline function
+    # tokenizer -> model -> postproccessing 
+    # raw text -> tokenizer (text to numbers) -> model -> logits
+
+    #tokenizing 
+        # text split into small chunks called tokens (can be full words or parts of words or punctuation)
+        # lastly the tokenizer matches each token to its numerical ID in the vocabulary of the pretrained model
+
+        #you must apply softmax layer in postprocessing turn logits into probabilities
+        # tokenizers can be word based, character based, or subword based
+        # you can choose how many X most frequent words to limit vocabulary
+
+
+
+        
+
+
+
+
+    
