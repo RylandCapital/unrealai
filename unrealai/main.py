@@ -1,5 +1,4 @@
 from utils.openai_interact import ChatApp
-from utils.twitter_api import twitter_sample
 
 import numpy as np
 import pandas as pd
