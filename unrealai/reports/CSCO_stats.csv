@@ -1,0 +1,2 @@
+final_value,total_return_pct,annualized_return_pct,max_drawdown_pct,sharpe_ratio,total_trades,win_pct_overall,num_long_trades,num_short_trades,win_pct_long,win_pct_short,buy_hold_total_return_pct,alpha_over_buy_hold,override_count,override_pct
+104553.50329856493,4.55350329856493,4.955622589410913,73.9860640905426,2.765660125936847,22,50.0,3,19,66.66666666666666,47.368421052631575,44.91958067040774,-40.366077371842806,22,9.482758620689655
