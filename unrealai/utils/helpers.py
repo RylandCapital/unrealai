@@ -172,7 +172,9 @@ tickers = ['CVX', 'HON', 'GOOGL', 'META', 'PG', 'JPM', 'ALL', 'GS', 'VZ',
 for f in tickers:
     df = get_daily_equity(f)
     df1 = df.iloc[0:int(len(df) - 252)]
+    print(len(df1))
     df2 = df.iloc[int(len(df) - 252):]
+    print(len(df2))
     df1.to_csv(r'P:\10_CWP Trade Department\Ryland\unrealai\unrealai\traindata\{0}.csv'.format(f))
     df2.to_csv(r'P:\10_CWP Trade Department\Ryland\unrealai\unrealai\testdata\{0}.csv'.format(f))
     df1.set_index('Date')[['Close']].plot(title=f)

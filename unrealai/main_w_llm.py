@@ -10,10 +10,14 @@ import base64
 import multiprocessing
 import threading
 from collections import deque
+from pathlib import Path
+import importlib.util
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.io as pio
@@ -29,9 +33,6 @@ from tensorflow.keras.layers import Flatten, Dense
 
 import psutil  # RAM logging
 
-from pathlib import Path
-import importlib.util
-
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -39,8 +40,6 @@ load_dotenv()
 # OpenAI (UPDATED): use the modern SDK + gpt-5-mini + reasoning high
 from openai import OpenAI
 
-# Use your existing env var name if you want.
-# Recommended is OPENAI_API_KEY, but we'll keep SECRET to match your setup.
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("SECRET")
 
 def _get_openai_client():
@@ -70,9 +69,7 @@ def overwatch_decision_gpt5mini(raw_action: int, img_b64_str: str) -> str:
         "Reply ONLY with: <number choice> - <two-sentence reason>."
     )
 
-    # Send image as a proper image input (not inside JSON)
     image_data_url = f"data:image/png;base64,{img_b64_str}"
-
     payload = {"trading_action": int(raw_action)}
 
     resp = client.responses.create(
@@ -89,12 +86,11 @@ def overwatch_decision_gpt5mini(raw_action: int, img_b64_str: str) -> str:
             }
         ],
     )
-
     return resp.output_text.strip()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Load your charting module
-FILE = Path(r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\report_vwapv1.py")
+FILE = Path(r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\utils\report_vwapv1.py")
 spec   = importlib.util.spec_from_file_location("report_vwapv1", FILE)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
@@ -125,7 +121,9 @@ def load_csv(csv_path):
         "#NDXZWBT_close", "#SPXZWBT_close", "#OEX%MA50_close", "#OEX%MA200_close",
         "#M2FED3_close", "#M2FED2_close", '$VIX_close', 'adjusted_close'
     ]
-    return pd.read_csv(csv_path, usecols=cols, parse_dates=['Date'], dtype={c: 'float32' for c in cols})
+    # keep floats float32 for speed/memory; Date parsed
+    dtypes = {c: 'float32' for c in cols if c != 'Date'}
+    return pd.read_csv(csv_path, usecols=cols, parse_dates=['Date'], dtype=dtypes)
 
 def logging_listener(q):
     while True:
@@ -142,7 +140,8 @@ def get_ram_usage():
     return psutil.virtual_memory().percent
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. Environment
+# 1. Environment (OPTIMIZED: precompute numpy arrays once)
+
 class TradingEnv(gym.Env):
     """Custom trading environment"""
 
@@ -153,22 +152,24 @@ class TradingEnv(gym.Env):
                  window_size=20,
                  initial_cash=100_000.0,
                  slippage_rate=0.0002,
-                 stop_loss=0.05,
+                 stop_loss=1_000, # intentionally huge to disable SL auto-close
                  take_profit=1_000,   # intentionally huge to disable TP auto-close
-                 cooldown_days=2,
-                 episode_length=252):
+                 cooldown_days=0):
         super().__init__()
 
         df = df.copy()
         df['Date'] = pd.to_datetime(df['Date'])
-        self.full_df = df.reset_index(drop=True)
-        self.window_size    = window_size
+        df = df.reset_index(drop=True)
+
+        if len(df) <= window_size:
+            raise ValueError("Dataframe too short for selected window_size.")
+
+        self.window_size    = int(window_size)
         self.initial_cash   = float(initial_cash)
-        self.slippage_rate  = slippage_rate
-        self.stop_loss      = stop_loss
-        self.take_profit    = take_profit
-        self.cooldown_days  = cooldown_days
-        self.episode_length = episode_length
+        self.slippage_rate  = float(slippage_rate)
+        self.stop_loss      = float(stop_loss)
+        self.take_profit    = float(take_profit)
+        self.cooldown_days  = int(cooldown_days)
 
         self.feature_cols = [
             'above_21_sma', 'above_55_sma', 'above_200_sma', '21day_rsi',
@@ -178,29 +179,23 @@ class TradingEnv(gym.Env):
             "#M2FED3_close", "#M2FED2_close", '$VIX_close'
         ]
 
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf,
-                                            shape=(self.window_size, len(self.feature_cols)),
-                                            dtype=np.float32)
+        # Precompute numpy arrays once (big speedup)
+        self.features = df[self.feature_cols].to_numpy(dtype=np.float32)          # (T, F)
+        self.prices   = df['adjusted_close'].to_numpy(dtype=np.float32)           # (T,)
+        self.dates    = df['Date'].to_numpy(dtype='datetime64[ns]')               # (T,)
+
+        self.n_steps = int(len(df))
+
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf,
+            shape=(self.window_size, len(self.feature_cols)),
+            dtype=np.float32
+        )
         self.action_space = spaces.Discrete(4)
 
-        self._reset_episode_slice()
         self.reset()
 
-    # ---------------------------------------------------------------------
-    # Episode helpers
-    def _reset_episode_slice(self):
-        if self.episode_length is None:
-            self.df = self.full_df  # view only
-        else:
-            max_start = len(self.full_df) - self.episode_length
-            if max_start <= 0:
-                raise ValueError("Dataframe too short for desired episode length.")
-            start = random.randint(0, max_start)
-            end   = start + self.episode_length
-            self.df = self.full_df.iloc[start:end]
-
     def reset(self):
-        self._reset_episode_slice()
         self.current_step       = self.window_size
         self.position           = 0   # 0 = flat, 1 = long, -1 = short
         self.shares             = 0.0
@@ -211,21 +206,19 @@ class TradingEnv(gym.Env):
         self.equity             = self.initial_cash
         self.cooldown_remaining = 0
         self.trades             = []
-        self.close_hits         = 0   # count of explicit agent closes in this episode
+        self.close_hits         = 0
         self.done               = False
         return self._get_obs()
 
     @property
     def current_datetime(self):
-        """Returns the datetime of the current step from the 'Date' column."""
-        idx = min(max(self.current_step, 0), len(self.df) - 1)
-        return self.df['Date'].iat[idx]
+        idx = min(max(self.current_step, 0), self.n_steps - 1)
+        # keep same behavior as before: return datetime-ish value
+        return pd.Timestamp(self.dates[idx]).to_pydatetime()
 
-    # ---------------------------------------------------------------------
-    # Internal helpers
     def _get_obs(self):
         start = self.current_step - self.window_size
-        return self.df[self.feature_cols].iloc[start:self.current_step].values.astype(np.float32)
+        return self.features[start:self.current_step]  # already float32
 
     def _apply_slippage(self, value):
         return value * (1 - self.slippage_rate)
@@ -246,9 +239,10 @@ class TradingEnv(gym.Env):
             self.cash    -= buy_back_cost
             trade_label   = 'close_short'
 
-        pct = pnl_dollars / (self.shares * self.entry_price) if self.entry_price else 0.0
+        denom = (self.shares * self.entry_price)
+        pct = (pnl_dollars / denom) if denom else 0.0
         ttm = (self.current_step - self.position_open_step) or 1
-        self.trades.append((trade_label, self.current_step, price, pct, ttm))
+        self.trades.append((trade_label, self.current_step, float(price), float(pct), int(ttm)))
 
         # reset position
         self.position           = 0
@@ -257,23 +251,21 @@ class TradingEnv(gym.Env):
         self.position_open_step = None
         self.equity             = self.cash
         self.entry_equity       = None
-        return pct
+        return float(pct)
 
-    # ---------------------------------------------------------------------
-    # Core step method
     def step(self, action):
         if self.done:
             raise RuntimeError("Episode already done")
 
         # Forced close at end of data
-        if self.current_step >= len(self.df) - 1:
+        if self.current_step >= self.n_steps - 1:
             if self.position != 0:
-                self._do_close(self.df['adjusted_close'].iat[self.current_step])
+                self._do_close(float(self.prices[self.current_step]))
             self.done = True
             return self._get_obs(), 0.0, True, {}
 
-        price        = self.df['adjusted_close'].iat[self.current_step]
-        reward       = 0.0
+        price  = float(self.prices[self.current_step])
+        reward = 0.0
 
         # 1) Handle agent-initiated CLOSE
         if self.position != 0 and action == ACTION_CLOSE:
@@ -293,7 +285,7 @@ class TradingEnv(gym.Env):
         # 3) Opening logic (only if flat and not in cooldown)
         if self.position == 0 and self.cooldown_remaining == 0:
             if action in (ACTION_LONG, ACTION_SHORT):
-                trade_value = self.cash            # all-in sizing
+                trade_value = self.cash
                 slip_cost   = trade_value * self.slippage_rate
                 shares      = (trade_value - slip_cost) / price if price else 0.0
 
@@ -306,9 +298,9 @@ class TradingEnv(gym.Env):
                     self.position = -1
                     self.trades.append(('open_short', self.current_step, price, None, None))
 
-                self.shares             = shares
-                self.entry_price        = price
-                self.position_open_step = self.current_step
+                self.shares             = float(shares)
+                self.entry_price        = float(price)
+                self.position_open_step = int(self.current_step)
                 self.entry_equity = self.cash + (self.shares * price if self.position == 1
                                      else -self.shares * price)
 
@@ -316,35 +308,33 @@ class TradingEnv(gym.Env):
             self.cooldown_remaining -= 1
 
         # 4) Update equity mark-to-market
-        if   self.position == 1:
+        if self.position == 1:
             self.equity = self.cash + self.shares * price
         elif self.position == -1:
-            self.equity = self.cash + self.shares * price
+            self.equity = self.cash - self.shares * price
         else:
             self.equity = self.cash
 
         if self.position != 0:
-            # Unrealised P&L in %, relative to entry equity
             step_reward = (self.equity - self.entry_equity) / self.entry_equity
         else:
             step_reward = 0.0
 
-        reward += step_reward
+        reward += float(step_reward)
 
-        # Advance
         self.current_step += 1
-        if self.current_step >= len(self.df):
+        if self.current_step >= self.n_steps:
             self.done = True
 
-        return self._get_obs(), reward, self.done, {}
+        return self._get_obs(), float(reward), self.done, {}
 
-    # ---------------------------------------------------------------------
     def render(self, mode='human'):
         print(f"Step={self.current_step}, Pos={self.position}, Shares={self.shares:.2f}, "
               f"Cash={self.cash:.2f}, Eq={self.equity:.2f}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. DQN Agent (unchanged architecture; only variable names)
+# 2. DQN Agent (OPTIMIZED: faster q_vals via direct model call)
+
 class DQNAgent:
     def __init__(self, state_size, action_size,
                  learning_rate=0.001, gamma=0.95,
@@ -362,10 +352,11 @@ class DQNAgent:
         self.memory        = deque(maxlen=memory_size)
         self.train_step_counter = 0
         self.target_update_freq = 50
-        self.overwatch_counter = 0
-        self.override_count   = 0
-
-        self.overwatch_enabled = True
+        self.overwatch_counter  = 0
+        self.override_count     = 0
+        self.overwatch_logs     = []
+        self.use_episode_epsilon_schedule = True
+        self.overwatch_enabled  = True
 
         self.model        = self._build_model()
         self.target_model = self._build_model()
@@ -400,7 +391,8 @@ class DQNAgent:
         if np.random.rand() <= self.epsilon:
             raw_action = random.randrange(self.action_size)
         else:
-            q_vals     = self.model.predict(state[np.newaxis, :], verbose=0)[0]
+            # OPTIMIZATION: avoid model.predict overhead
+            q_vals = self.model(state[np.newaxis, :], training=False).numpy()[0]
             raw_action = int(np.argmax(q_vals))
 
         # 2) optionally call your manager
@@ -429,7 +421,7 @@ class DQNAgent:
                 bbox=dict(facecolor='black', alpha=0.6)
             )
 
-            img_bytes  = fig_to_bytes(fig)
+            img_bytes   = fig_to_bytes(fig)
             img_b64_str = base64.b64encode(img_bytes).decode("utf-8")
 
             sdir = r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\reports"
@@ -438,20 +430,46 @@ class DQNAgent:
             fig.savefig(full_path, dpi=300, bbox_inches='tight')
             plt.close(fig)
 
-            # 3) call GPT-5-mini (UPDATED)
             try:
                 resp_txt = overwatch_decision_gpt5mini(raw_action, img_b64_str)
             except Exception as e:
-                # If OpenAI call fails, fall back to raw_action
-                # (You can add logging here if you want.)
+                self.overwatch_logs.append({
+                    "symbol": symbol,
+                    "step": int(env.current_step),
+                    "date": env.current_datetime.strftime("%Y-%m-%d"),
+                    "position": int(env.position),
+                    "raw_action": int(raw_action),
+                    "final_action": int(raw_action),
+                    "overrode": False,
+                    "model_action": None,
+                    "model_reply": "",
+                    "error": str(e),
+                })
                 return raw_action
 
             m = re.search(r'\b([0-3])\b', resp_txt)
+            model_action = int(m.group(1)) if m else None
             if m:
                 override = int(m.group(1))
                 if override != raw_action:
                     self.override_count += 1
-                return override
+                final_action = override
+            else:
+                final_action = raw_action
+
+            self.overwatch_logs.append({
+                "symbol": symbol,
+                "step": int(env.current_step),
+                "date": env.current_datetime.strftime("%Y-%m-%d"),
+                "position": int(env.position),
+                "raw_action": int(raw_action),
+                "final_action": int(final_action),
+                "overrode": bool(final_action != raw_action),
+                "model_action": model_action,
+                "model_reply": resp_txt,
+                "error": "",
+            })
+            return final_action
 
         return raw_action
 
@@ -480,7 +498,7 @@ class DQNAgent:
         if self.train_step_counter % self.target_update_freq == 0:
             self.update_target_model()
 
-        if self.epsilon > self.epsilon_min:
+        if (not self.use_episode_epsilon_schedule) and self.epsilon > self.epsilon_min:
             self.epsilon = max(self.epsilon_min,
                                self.epsilon * self.epsilon_decay)
 
@@ -552,9 +570,12 @@ def compute_portfolio_stats(equity_curve, invested_curve, trades,
     if buy_hold_curve and len(buy_hold_curve) > 1:
         fbv = buy_hold_curve[-1]
         bhr = (fbv - initial_value) / initial_value
+        bh_dr = np.diff(buy_hold_curve) / np.array(buy_hold_curve[:-1])
+        bh_sr = np.mean(bh_dr) / (np.std(bh_dr) + 1e-9) * np.sqrt(252)
         stats.update({
             'buy_hold_total_return_pct': bhr * 100,
             'alpha_over_buy_hold':       (tot_ret - bhr) * 100,
+            'buy_hold_sharpe_ratio':     bh_sr,
         })
 
     return stats
@@ -582,10 +603,10 @@ def plot_aggregated_results(agent_eq, bh_eq, invested, stats, save_path=None):
     print("------------------------\n")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Training & Testing helpers
+# 4. Training & Testing helpers (OPTIMIZED: train every 4 steps)
 
 def train_agent_on_df(agent, df, *, episodes=10, window_size=20,
-                      initial_cash=100_000, episode_length=252,
+                      initial_cash=100_000,
                       report_csv_path=None, log_queue=None, symbol=""):
     reward_hist = []
     all_trades  = []
@@ -603,18 +624,40 @@ def train_agent_on_df(agent, df, *, episodes=10, window_size=20,
                      slippage_rate=0.0002,
                      stop_loss=0.05,
                      take_profit=1_000,
-                     cooldown_days=2,
-                     episode_length=episode_length)
+                     cooldown_days=2)
+
+    def _episode_epsilon(ep_num_1_based: int) -> float:
+        eps_start = 1.0
+        eps_mid   = 0.05
+        eps_low   = 0.02
+        linear_drop = (eps_start - eps_mid) / 80.0
+
+        if ep_num_1_based <= 79:
+            return max(eps_mid, eps_start - (ep_num_1_based - 1) * linear_drop)
+        if ep_num_1_based <= 90:
+            return eps_mid
+        return eps_low
+
+    train_every = 4  # OPTIMIZATION: only replay every 4 steps
 
     for e in range(episodes):
         agent.override_count = 0
+        if agent.use_episode_epsilon_schedule:
+            agent.epsilon = _episode_epsilon(e + 1)
+
         state = env.reset()
         tot_r = 0.0
+        step_i = 0
+
         while True:
-            action               = agent.act(state, env=env, symbol=symbol)
+            action = agent.act(state, env=env, symbol=symbol)
             next_state, reward, done, _ = env.step(action)
+
             agent.remember(state, action, reward, next_state, done)
-            agent.replay()
+
+            step_i += 1
+            if step_i % train_every == 0:
+                agent.replay()
 
             if csv_writer:
                 csv_writer.writerow({
@@ -636,46 +679,47 @@ def train_agent_on_df(agent, df, *, episodes=10, window_size=20,
         all_trades.extend(env.trades)
 
         child_log(log_queue, f"[{symbol}] Episode {e + 1}/{episodes} "
-                     f"epsilon={agent.epsilon:.4f} "
-                     f"reward={tot_r:.4f} "
-                     f"closes={env.close_hits} "
-                     f"overrides={agent.override_count}")
+                             f"epsilon={agent.epsilon:.4f} "
+                             f"reward={tot_r:.4f} "
+                             f"closes={env.close_hits} "
+                             f"overrides={agent.override_count}")
 
     if csv_file:
         csv_file.close()
 
-    summarize_trades(all_trades, title=f"{symbol} Train Trades",
-                     log_queue=log_queue)
+    summarize_trades(all_trades, title=f"{symbol} Train Trades", log_queue=log_queue)
     gc.collect()
     return reward_hist, all_trades
 
 def test_agent_on_df(agent, df, *, window_size=20, initial_cash=100_000,
                      log_queue=None, symbol=""):
-    env = TradingEnv(df, window_size=window_size,
-                     initial_cash=initial_cash,
-                     episode_length=None)
+    env = TradingEnv(df, window_size=window_size, initial_cash=initial_cash)
     agent.override_count = 0
-    state  = env.reset()
+    agent.overwatch_logs = []
+    state = env.reset()
     steps, portfolio, invested = [], [], []
+
     while True:
-        action               = agent.act(state, env=env, symbol=symbol)
+        action = agent.act(state, env=env, symbol=symbol)
         next_state, _, done, _ = env.step(action)
         state = next_state
 
         steps.append(env.current_step)
         portfolio.append(env.equity)
         invested.append(initial_cash if env.position != 0 else 0)
+
         if done:
             break
 
-    summarize_trades(env.trades, title=f"{symbol} Test Trades",
-                     log_queue=log_queue)
+    summarize_trades(env.trades, title=f"{symbol} Test Trades", log_queue=log_queue)
 
-    start_price = df['adjusted_close'].iat[window_size]
+    start_price = float(env.prices[window_size]) if window_size < len(env.prices) else float(df['adjusted_close'].iat[window_size])
     bh_shares   = initial_cash / start_price if start_price else 0
-    bh_curve    = [bh_shares * df['adjusted_close'].iat[i] for i in steps]
+    bh_curve    = [bh_shares * float(env.prices[i]) for i in steps]
+
     override_ct  = agent.override_count
     override_pct = override_ct / len(steps) * 100 if steps else 0
+
     return {
         'steps':            steps,
         'portfolio_values': portfolio,
@@ -683,14 +727,15 @@ def test_agent_on_df(agent, df, *, window_size=20, initial_cash=100_000,
         'buy_hold_values':  bh_curve,
         'trades':           env.trades,
         'override_count':   override_ct,
-        'override_pct':     override_pct
+        'override_pct':     override_pct,
+        'overwatch_logs':   agent.overwatch_logs,
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Worker function for multiprocessing
 
 def process_stock(args):
-    train_csv, test_csv, agent_params, win, ep, ini, ep_len, out_dir, log_q = args
+    train_csv, test_csv, agent_params, win, ep, ini, out_dir, log_q = args
     sym = os.path.splitext(os.path.basename(train_csv))[0]
     child_log(log_q, f"=== {sym} start ===")
 
@@ -698,12 +743,13 @@ def process_stock(args):
 
     # Train
     agent.overwatch_enabled = False
-    df_tr   = load_csv(train_csv)
-    rewards, _ = train_agent_on_df(agent, df_tr, episodes=ep, window_size=win,
-                                   initial_cash=ini, episode_length=ep_len,
-                                   report_csv_path=os.path.join(out_dir,
-                                                                 f"{sym}_train.csv"),
-                                   log_queue=log_q, symbol=sym)
+    df_tr = load_csv(train_csv)
+    rewards, _ = train_agent_on_df(
+        agent, df_tr, episodes=ep, window_size=win,
+        initial_cash=ini,
+        report_csv_path=os.path.join(out_dir, f"{sym}_train.csv"),
+        log_queue=log_q, symbol=sym
+    )
 
     plt.figure(figsize=(8, 3))
     plt.plot(rewards)
@@ -730,13 +776,15 @@ def process_stock(args):
                  columns=['type', 'step', 'price', 'pnl_pct', 'time']).to_csv(
         os.path.join(out_dir, f"{sym}_trades.csv"), index=False)
 
+    pd.DataFrame(res.get('overwatch_logs', [])).to_csv(
+        os.path.join(out_dir, f"{sym}_overwatch.csv"), index=False)
+
     stats = compute_portfolio_stats(res['portfolio_values'],
                                     res['invested_history'], res['trades'],
                                     ini, res['buy_hold_values'])
     stats['override_count'] = res['override_count']
     stats['override_pct']   = res['override_pct']
-    pd.DataFrame([stats]).to_csv(os.path.join(out_dir, f"{sym}_stats.csv"),
-                                 index=False)
+    pd.DataFrame([stats]).to_csv(os.path.join(out_dir, f"{sym}_stats.csv"), index=False)
 
     child_log(log_q, f"=== {sym} done ===")
 
@@ -749,22 +797,22 @@ def process_stock(args):
 
 def main_loop(agent_params, train_files, test_files, output_dir, *,
               window_size=20, episodes=10, initial_cash=100_000,
-              episode_length=252, log_queue=None):
+              log_queue=None):
     os.makedirs(output_dir, exist_ok=True)
 
     args = [(tr, te, agent_params, window_size, episodes, initial_cash,
-             episode_length, output_dir, log_queue)
+             output_dir, log_queue)
             for tr, te in zip(train_files, test_files)]
 
     child_log(log_queue, "Starting multiprocessing pool")
-    with multiprocessing.Pool(min(len(args), 2), maxtasksperchild=1) as pool:
+    with multiprocessing.Pool(min(len(args), 5), maxtasksperchild=1) as pool:
         results = pool.map(process_stock, args)
     child_log(log_queue, "Pool finished")
 
     if not results:
         return
 
-    min_len   = min(len(r['portfolio_values']) for r in results)
+    min_len = min(len(r['portfolio_values']) for r in results)
     norm_curves, bh_curves, inv_curves = [], [], []
     for r in results:
         norm_curves.append(np.array(r['portfolio_values'][:min_len]) / initial_cash)
@@ -775,24 +823,49 @@ def main_loop(agent_params, train_files, test_files, output_dir, *,
     agg_bh     = np.mean(bh_curves,   axis=0) * initial_cash
     agg_inv    = np.mean(inv_curves,  axis=0) * initial_cash
 
-    total_overrides = sum(r['override_count'] for r in results)
-    total_steps     = sum(len(r['steps'])      for r in results)
+    total_overrides  = sum(r['override_count'] for r in results)
+    total_steps      = sum(len(r['steps']) for r in results)
     agg_override_pct = total_overrides / total_steps * 100 if total_steps else 0
 
-    agg_stats = compute_portfolio_stats(list(agg_equity), list(agg_inv), [],
+    agg_overwatch_logs = [row for r in results for row in r.get('overwatch_logs', [])]
+    pd.DataFrame(agg_overwatch_logs).to_csv(
+        os.path.join(output_dir, "aggregated_overwatch.csv"), index=False)
+
+    agg_trades = [t for r in results for t in r.get('trades', [])]
+    if not agg_trades:
+        for tr in train_files:
+            sym = os.path.splitext(os.path.basename(tr))[0]
+            trades_csv = os.path.join(output_dir, f"{sym}_trades.csv")
+            if not os.path.exists(trades_csv):
+                continue
+            try:
+                tdf = pd.read_csv(trades_csv)
+                if {'type', 'step', 'price', 'pnl_pct', 'time'}.issubset(tdf.columns):
+                    agg_trades.extend(
+                        list(tdf[['type', 'step', 'price', 'pnl_pct', 'time']]
+                             .itertuples(index=False, name=None))
+                    )
+            except Exception:
+                continue
+
+    child_log(log_queue, f"Aggregated trades counted: {len(agg_trades)}")
+
+    agg_stats = compute_portfolio_stats(list(agg_equity), list(agg_inv), agg_trades,
                                         initial_cash, list(agg_bh))
     agg_stats['override_count'] = total_overrides
     agg_stats['override_pct']   = agg_override_pct
-    pd.DataFrame([agg_stats]).to_csv(os.path.join(output_dir,
-                                                  "aggregated_stats.csv"),
+    pd.DataFrame([agg_stats]).to_csv(os.path.join(output_dir, "aggregated_stats.csv"),
                                      index=False)
 
-    plot_aggregated_results(agg_equity, agg_bh, agg_inv,
-                            agg_stats, save_path=os.path.join(output_dir,
-                                                              "aggregated_curve.html"))
+    plot_aggregated_results(
+        agg_equity, agg_bh, agg_inv,
+        agg_stats,
+        save_path=os.path.join(output_dir, "aggregated_curve.html")
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. Entry point
+
 if __name__ == "__main__":
     multiprocessing.set_start_method('spawn', force=True)
 
@@ -801,21 +874,24 @@ if __name__ == "__main__":
     threading.Thread(target=logging_listener, args=(log_q,), daemon=True).start()
 
     train_files = [
-        r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\traindata\CSCO.csv",
+        r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\traindata\NFLX.csv",
+        r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\traindata\IBM.csv",
+        r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\traindata\CVX.csv",
     ]
     test_files = [
-        r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\testdata\CSCO.csv",
+        r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\testdata\NFLX.csv",
+        r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\testdata\IBM.csv",
+        r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\testdata\CVX.csv",
     ]
 
-    output_dir     = r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\reports"
-    window_size    = 20
-    episodes       = 100
-    initial_cash   = 100_000
-    episode_length = 252
+    output_dir   = r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\reports"
+    window_size  = 34
+    episodes     = 100
+    initial_cash = 100_000
 
-    dummy_df   = load_csv(train_files[0])
+    dummy_df = load_csv(train_files[0])
     dummy_df['Date'] = pd.date_range(end=pd.Timestamp.today(), periods=len(dummy_df))
-    state_size = (window_size, len(TradingEnv(dummy_df).feature_cols))
+    state_size = (window_size, len(TradingEnv(dummy_df, window_size=window_size).feature_cols))
     action_size = 4
 
     agent_parameters = {
@@ -833,7 +909,7 @@ if __name__ == "__main__":
     start_time = time.time()
     main_loop(agent_parameters, train_files, test_files, output_dir,
               window_size=window_size, episodes=episodes,
-              initial_cash=initial_cash, episode_length=episode_length,
+              initial_cash=initial_cash,
               log_queue=log_q)
 
     elapsed = time.time() - start_time
