@@ -96,7 +96,9 @@ class CFG:
     EPISODE_EPSILON_START = 1.00
     EPISODE_EPSILON_END = 0.00
     BATCH_SYMBOL_LIMIT = 12
-    COMPLETED_SYMBOLS = []
+    COMPLETED_SYMBOLS = [
+ 
+  ]
     WRITE_BATCH_PROGRESS_FILES = True
 
     # Replay buffer reset policy
