@@ -169,3 +169,5 @@ unrealai/models/
 unrealai/live_reports/
 unrealai/dashboard_data/
 unrealai/overwatch_charts/
+unrealai/traindata/
+unrealai/testdata/
