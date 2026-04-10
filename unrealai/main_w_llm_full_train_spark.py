@@ -5,8 +5,10 @@ import os
 # Must be set before importing tensorflow
 # ─────────────────────────────────────────────────────────────────────────────
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
+os.environ.setdefault("TF_DETERMINISTIC_OPS", "0")
 os.environ.setdefault("PYTHONHASHSEED", "42")
+os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
+os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
 
 import io
 import random
@@ -38,6 +40,7 @@ from pathlib import Path
 
 import tensorflow as tf
 from tensorflow.keras import optimizers
+from tensorflow.keras import mixed_precision
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Flatten, Dense, Input, Lambda, Add
 
@@ -54,15 +57,28 @@ except ModuleNotFoundError:
     from unrealai.utils.feature_compat import BACKFILLABLE_FEATURE_COLS, ensure_backfilled_feature_columns
 
 load_dotenv()
+APP_DIR = Path(__file__).resolve().parent
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ✅ USER-TUNABLE CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 class CFG:
 
-    NUMBER_OF_POOLS = 12
+    # Spark-friendly default: one trainer process feeding one GPU.
+    USE_MULTIPROCESSING = False
+    NUMBER_OF_POOLS = 1
     TASKS_PER_CHILD = 1
     SEED = 42
+
+    TF_ENABLE_GPU = True
+    TF_VISIBLE_GPU_INDEX = 0
+    TF_GPU_MEMORY_GROWTH = True
+    TF_ENABLE_XLA = True
+    TF_JIT_COMPILE_MODEL = True
+    TF_ENABLE_MIXED_PRECISION = True
+    TF_ENABLE_DETERMINISM = False
+    TF_INTRA_OP_THREADS = 0
+    TF_INTER_OP_THREADS = 0
 
     COOLDOWN_DAYS = 3
     MIN_HOLD_DAYS = 3
@@ -80,7 +96,7 @@ class CFG:
     OVERWATCH_EVERY_N_STEPS = 5
     OVERWATCH_ALLOW_CONSTRAINT_OVERRIDE = True
     SAVE_OVERWATCH_CHARTS = True
-    OVERWATCH_CHARTS_DIR = r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\overwatch_charts\main_w_llm"
+    OVERWATCH_CHARTS_DIR = str(APP_DIR / "overwatch_charts" / "main_w_llm_full_train_spark")
 
     TRADE_OPEN_PENALTY_TRAIN = 0.0000
     TRADE_OPEN_PENALTY_TEST = 0.0000
@@ -92,9 +108,12 @@ class CFG:
     STOP_LOSS_TEST = .15
     TAKE_PROFIT_TEST = 1000.0
 
-    TRAIN_ROLLING_YEARS = 2
-    TRAIN_ROLLING_STEP_YEARS = 1
     TRAIN_RANDOM_START_MAX = 55
+    EPISODE_EPSILON_START = 1.00
+    EPISODE_EPSILON_END = 0.00
+    BATCH_SYMBOL_LIMIT = 12
+    COMPLETED_SYMBOLS = []
+    WRITE_BATCH_PROGRESS_FILES = True
 
     # Replay buffer reset policy
     # "interval" -> reset every TRAIN_MEMORY_RESET_EVERY episodes
@@ -105,11 +124,11 @@ class CFG:
     TRAIN_MEMORY_RESET_ONCE_AT_EPISODE = 20
 
     # main toggles for speed.
-    TRAIN_REPLAY_EVERY_N_STEPS = 21
-    BATCHSIZE = 64
+    TRAIN_REPLAY_EVERY_N_STEPS = 34
+    BATCHSIZE = 55
     WINDOW_SIZE = 21
-    EPISODES = 150
-    GREEDY_EVAL_EVERY = 5
+    EPISODES = 30
+    GREEDY_EVAL_EVERY = 10
 
     REWARD_ROLLING_MEDIAN_WINDOW = 10
     GREEDY_EVAL_MAX_WINDOWS = None
@@ -125,16 +144,16 @@ class CFG:
     OVERWATCH_REASONING_EFFORT = "high"
     MODEL = "gpt-5-mini"
 
-    OUTPUT_DIR = r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\reports"
+    OUTPUT_DIR = str(APP_DIR / "reports")
 
     # Model checkpointing
-    MODEL_DIR = r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\models"
+    MODEL_DIR = str(APP_DIR / "models")
     SAVE_MODEL_CHECKPOINTS = True
     RESUME_FROM_CHECKPOINT = False   # first run False; tomorrow after close set True
     REUSE_SAVED_SCALER = True        # when resuming, keep old scaler for continuity
 
-    TRAIN_DIR = Path(r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\traindata")
-    TEST_DIR  = Path(r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\testdata")
+    TRAIN_DIR = APP_DIR / "traindata"
+    TEST_DIR  = APP_DIR / "testdata"
 
     train_map = {p.stem.upper(): p for p in TRAIN_DIR.glob("*.csv")}
     test_map  = {p.stem.upper(): p for p in TEST_DIR.glob("*.csv")}
@@ -154,7 +173,7 @@ class CFG:
     
     INITIAL_CASH = 100_000_000
 
-    REPORT_VWAP_MODULE_PATH = r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\utils\overwatch_chart.py"
+    REPORT_VWAP_MODULE_PATH = str(APP_DIR / "utils" / "overwatch_chart.py")
 
     # Test execution replay modes
     FILL_MODE_CLOSE_T = "close_t"
@@ -181,10 +200,79 @@ def set_global_determinism(seed: int):
         tf.keras.utils.set_random_seed(seed)
     except Exception:
         tf.random.set_seed(seed)
-    try:
-        tf.config.experimental.enable_op_determinism()
-    except Exception:
-        pass
+    if bool(getattr(CFG, "TF_ENABLE_DETERMINISM", False)):
+        try:
+            tf.config.experimental.enable_op_determinism()
+        except Exception:
+            pass
+
+
+def configure_tensorflow_runtime(log_queue=None):
+    if getattr(configure_tensorflow_runtime, "_configured", False):
+        return getattr(configure_tensorflow_runtime, "_summary", {})
+
+    summary = {
+        "gpu_enabled": bool(getattr(CFG, "TF_ENABLE_GPU", True)),
+        "mixed_precision": bool(getattr(CFG, "TF_ENABLE_MIXED_PRECISION", True)),
+        "xla": bool(getattr(CFG, "TF_ENABLE_XLA", True)),
+        "jit_compile_model": bool(getattr(CFG, "TF_JIT_COMPILE_MODEL", True)),
+    }
+
+    if int(getattr(CFG, "TF_INTRA_OP_THREADS", 0) or 0) > 0:
+        tf.config.threading.set_intra_op_parallelism_threads(int(CFG.TF_INTRA_OP_THREADS))
+        summary["intra_op_threads"] = int(CFG.TF_INTRA_OP_THREADS)
+
+    if int(getattr(CFG, "TF_INTER_OP_THREADS", 0) or 0) > 0:
+        tf.config.threading.set_inter_op_parallelism_threads(int(CFG.TF_INTER_OP_THREADS))
+        summary["inter_op_threads"] = int(CFG.TF_INTER_OP_THREADS)
+
+    gpus = tf.config.list_physical_devices("GPU")
+    visible_gpu_name = None
+
+    if bool(getattr(CFG, "TF_ENABLE_GPU", True)) and gpus:
+        gpu_index = int(getattr(CFG, "TF_VISIBLE_GPU_INDEX", 0) or 0)
+        gpu_index = max(0, min(gpu_index, len(gpus) - 1))
+        selected_gpu = gpus[gpu_index]
+        try:
+            tf.config.set_visible_devices(selected_gpu, "GPU")
+        except Exception:
+            pass
+        if bool(getattr(CFG, "TF_GPU_MEMORY_GROWTH", True)):
+            try:
+                tf.config.experimental.set_memory_growth(selected_gpu, True)
+            except Exception:
+                pass
+        visible_gpu_name = getattr(selected_gpu, "name", str(selected_gpu))
+    else:
+        try:
+            tf.config.set_visible_devices([], "GPU")
+        except Exception:
+            pass
+
+    if bool(getattr(CFG, "TF_ENABLE_XLA", True)):
+        try:
+            tf.config.optimizer.set_jit(True)
+        except Exception:
+            pass
+
+    if bool(getattr(CFG, "TF_ENABLE_MIXED_PRECISION", True)) and visible_gpu_name:
+        try:
+            mixed_precision.set_global_policy("mixed_float16")
+            summary["policy"] = "mixed_float16"
+        except Exception:
+            summary["policy"] = mixed_precision.global_policy().name
+    else:
+        try:
+            mixed_precision.set_global_policy("float32")
+        except Exception:
+            pass
+        summary["policy"] = "float32"
+
+    summary["visible_gpu"] = visible_gpu_name or "CPU"
+    configure_tensorflow_runtime._configured = True
+    configure_tensorflow_runtime._summary = summary
+    child_log(log_queue, f"TensorFlow runtime: {summary}")
+    return summary
 
 
 def aggressive_worker_cleanup(log_queue=None, symbol=""):
@@ -482,7 +570,52 @@ def logging_listener(q):
 
 def child_log(q, msg):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    q.put(f"[{ts}] {msg}")
+    payload = f"[{ts}] {msg}"
+    if q is None:
+        print(payload, flush=True)
+    else:
+        q.put(payload)
+
+
+def normalize_symbol_list(values) -> list[str]:
+    seen = set()
+    out = []
+    for value in values or []:
+        symbol = str(value).strip().upper()
+        if not symbol:
+            continue
+        if symbol not in seen:
+            seen.add(symbol)
+            out.append(symbol)
+    return out
+
+
+def symbol_from_csv_path(path: str) -> str:
+    return Path(path).stem.upper()
+
+
+def write_batch_progress_files(output_dir: str, completed_symbols: list[str], finished_symbols: list[str]) -> None:
+    if not bool(getattr(CFG, "WRITE_BATCH_PROGRESS_FILES", True)):
+        return
+
+    root = Path(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+
+    completed_symbols = normalize_symbol_list(completed_symbols)
+    finished_symbols = normalize_symbol_list(finished_symbols)
+
+    payload = {
+        "finished_batch": finished_symbols,
+        "completed_symbols": completed_symbols,
+    }
+    with open(root / "batch_progress.json", "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    with open(root / "completed_symbols_for_config.txt", "w", encoding="utf-8") as f:
+        f.write("COMPLETED_SYMBOLS = [\n")
+        for symbol in completed_symbols:
+            f.write(f'    "{symbol}",\n')
+        f.write("]\n")
 
 
 def save_overwatch_chart(fig, *, symbol: str, review_date: str, step: int, raw_action: int, source_tag: str) -> str | None:
@@ -627,55 +760,6 @@ def reset_overwatch_chart_storage(log_queue=None) -> None:
 
 def get_ram_usage():
     return psutil.virtual_memory().percent
-
-
-def make_rolling_windows(df: pd.DataFrame,
-                         *,
-                         years: int = 2,
-                         step_years: int = 1,
-                         trading_days_per_year: int = 252):
-    if df is None or df.empty:
-        return []
-
-    window_len = int(years * trading_days_per_year)
-    step_len = int(step_years * trading_days_per_year)
-
-    n = len(df)
-    if n <= window_len:
-        return [(0, n)]
-
-    windows = []
-    start = 0
-    while start + window_len <= n:
-        windows.append((start, start + window_len))
-        start += step_len
-
-    if windows and windows[-1][1] < n:
-        end = n
-        start = max(0, end - window_len)
-        if not windows or windows[-1] != (start, end):
-            windows.append((start, end))
-
-    uniq = []
-    seen = set()
-    for s, e in windows:
-        key = (int(s), int(e))
-        if key not in seen and e - s > 10:
-            uniq.append(key)
-            seen.add(key)
-
-    return uniq
-
-
-def select_fixed_eval_windows(windows, max_windows=None):
-    windows = list(windows or [])
-    if not windows:
-        return []
-    if max_windows is None or len(windows) <= int(max_windows):
-        return windows
-    idxs = np.linspace(0, len(windows) - 1, num=int(max_windows), dtype=int)
-    idxs = sorted(set(int(i) for i in idxs))
-    return [windows[i] for i in idxs]
 
 
 def first_existing_col(cols, candidates):
@@ -1396,10 +1480,10 @@ class DQNAgent:
         x = Dense(64, activation="relu")(x)
 
         v = Dense(32, activation="relu")(x)
-        v = Dense(1, activation="linear")(v)
+        v = Dense(1, activation="linear", dtype="float32")(v)
 
         a = Dense(32, activation="relu")(x)
-        a = Dense(self.action_size, activation="linear")(a)
+        a = Dense(self.action_size, activation="linear", dtype="float32")(a)
 
         a_norm = Lambda(mean_center_advantage, name="adv_center")(a)
         q = Add()([v, a_norm])
@@ -1407,7 +1491,8 @@ class DQNAgent:
         m = Model(inputs=inp, outputs=q)
         m.compile(
             optimizer=optimizers.Adam(learning_rate=self.learning_rate),
-            loss="mse"
+            loss="mse",
+            jit_compile=bool(getattr(CFG, "TF_JIT_COMPILE_MODEL", False)),
         )
         return m
 
@@ -1995,16 +2080,9 @@ def train_agent_on_df(agent, df, *, episodes=10, window_size=20,
     eval_episodes = []
     eval_rewards = []
 
-    windows = make_rolling_windows(
-        df,
-        years=int(CFG.TRAIN_ROLLING_YEARS),
-        step_years=int(CFG.TRAIN_ROLLING_STEP_YEARS),
-        trading_days_per_year=252
-    )
-    if not windows:
-        windows = [(0, len(df))]
+    windows = [(0, len(df))]
 
-    fixed_eval_windows = select_fixed_eval_windows(windows, CFG.GREEDY_EVAL_MAX_WINDOWS)
+    fixed_eval_windows = list(windows)
 
     csv_file = open(report_csv_path, "w", newline="") if report_csv_path else None
     csv_writer = None
@@ -2017,19 +2095,37 @@ def train_agent_on_df(agent, df, *, episodes=10, window_size=20,
         csv_writer.writeheader()
 
     def _episode_epsilon(ep_num_1_based: int) -> float:
-        ep = int(ep_num_1_based)
-        if ep <= 40:
-            return float(np.interp(ep, [1, 40], [1.00, 0.10]))
-        if ep <= 70:
-            return float(np.interp(ep, [41, 70], [0.10, 0.05]))
-        if ep <= 85:
-            return float(np.interp(ep, [71, 85], [0.05, 0.02]))
-        return 0.02
+        total_eps = max(1, int(episodes))
+        ep = min(max(1, int(ep_num_1_based)), total_eps)
+        if total_eps == 1:
+            return float(getattr(CFG, "EPISODE_EPSILON_END", 0.0))
+        return float(
+            np.interp(
+                ep,
+                [1, total_eps],
+                [
+                    float(getattr(CFG, "EPISODE_EPSILON_START", 1.0)),
+                    float(getattr(CFG, "EPISODE_EPSILON_END", 0.0)),
+                ],
+            )
+        )
 
     train_every = max(1, int(CFG.TRAIN_REPLAY_EVERY_N_STEPS))
     agent.overwatch_enabled = False
 
     child_log(log_queue, f"[{symbol}] Replay reset policy: {describe_memory_reset_policy()}")
+    child_log(
+        log_queue,
+        f"[{symbol}] Episode epsilon schedule: "
+        f"{float(getattr(CFG, 'EPISODE_EPSILON_START', 1.0)):.2f} -> "
+        f"{float(getattr(CFG, 'EPISODE_EPSILON_END', 0.0)):.2f} "
+        f"over {int(episodes)} episodes"
+    )
+    child_log(
+        log_queue,
+        f"[{symbol}] Training mode: full dataset per episode "
+        f"(random start max={int(CFG.TRAIN_RANDOM_START_MAX)} bars)"
+    )
 
     for e in range(episodes):
         if should_reset_memory_after_episode(e):
@@ -2605,6 +2701,7 @@ def build_aggregated_overwatch_from_disk(output_dir, symbols):
 # ─────────────────────────────────────────────────────────────────────────────
 def process_stock(args):
     train_csv, test_csv, agent_params, win, ep, ini, out_dir, log_q, worker_seed = args
+    configure_tensorflow_runtime(log_q)
     set_global_determinism(worker_seed)
 
     sym = os.path.splitext(os.path.basename(train_csv))[0]
@@ -2776,7 +2873,7 @@ def process_stock(args):
 # ─────────────────────────────────────────────────────────────────────────────
 def main_loop(agent_params, train_files, test_files, output_dir, *,
               window_size=20, episodes=10, initial_cash=100_000,
-              log_queue=None):
+              log_queue=None, precompleted_symbols=None):
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(CFG.MODEL_DIR, exist_ok=True)
 
@@ -2794,36 +2891,56 @@ def main_loop(agent_params, train_files, test_files, output_dir, *,
                      output_dir, log_queue, worker_seed))
 
     worker_count = min(len(args), int(CFG.NUMBER_OF_POOLS))
-    child_log(log_queue, f"Starting multiprocessing pool | workers={worker_count}")
-
-    ctx = multiprocessing.get_context("spawn")
     finished_symbols = []
+    use_pool = bool(getattr(CFG, "USE_MULTIPROCESSING", False)) and worker_count > 1
 
-    with ctx.Pool(worker_count, maxtasksperchild=CFG.TASKS_PER_CHILD) as pool:
-        for item in pool.imap_unordered(process_stock, args, chunksize=1):
+    if use_pool:
+        child_log(log_queue, f"Starting multiprocessing pool | workers={worker_count}")
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(worker_count, maxtasksperchild=CFG.TASKS_PER_CHILD) as pool:
+            for item in pool.imap_unordered(process_stock, args, chunksize=1):
+                sym = item["symbol"]
+                finished_symbols.append(sym)
+                child_log(log_queue, f"Collected worker result {len(finished_symbols)}/{len(args)} | {sym}")
+    else:
+        child_log(log_queue, "Running symbols sequentially in a single process for GPU stability")
+        for idx, payload in enumerate(args, start=1):
+            item = process_stock(payload)
             sym = item["symbol"]
             finished_symbols.append(sym)
-            child_log(log_queue, f"Collected worker result {len(finished_symbols)}/{len(args)} | {sym}")
+            child_log(log_queue, f"Collected worker result {idx}/{len(args)} | {sym}")
 
     child_log(log_queue, "Pool finished")
 
     if not finished_symbols:
-        return
+        return []
 
     finished_symbols = sorted(finished_symbols)
-    child_log(log_queue, "Rebuilding aggregation inputs from per-symbol CSV outputs")
+    aggregate_symbols = sorted(set(normalize_symbol_list(precompleted_symbols)) | set(finished_symbols))
+    child_log(
+        log_queue,
+        f"Rebuilding aggregation inputs from per-symbol CSV outputs "
+        f"(aggregate_symbols={len(aggregate_symbols)})"
+    )
 
     results = []
-    for sym in finished_symbols:
-        results.append(
-            load_symbol_result_from_disk(
-                output_dir=output_dir,
-                symbol=sym,
-                sleeve_initial_cash=initial_cash
+    loaded_symbols = []
+    for sym in aggregate_symbols:
+        try:
+            results.append(
+                load_symbol_result_from_disk(
+                    output_dir=output_dir,
+                    symbol=sym,
+                    sleeve_initial_cash=initial_cash
+                )
             )
-        )
+            loaded_symbols.append(sym)
+        except Exception as exc:
+            child_log(log_queue, f"[aggregate] Skipping {sym}: {exc}")
 
     child_log(log_queue, f"Loaded {len(results)} symbol result sets from disk")
+    if not results:
+        return finished_symbols
 
     agg_dates_bh, agg_bh, _ = build_real_multiasset_portfolio(
         results=results,
@@ -2914,7 +3031,7 @@ def main_loop(agent_params, train_files, test_files, output_dir, *,
     )
 
     child_log(log_queue, "Writing aggregated_overwatch.csv")
-    agg_overwatch_df = build_aggregated_overwatch_from_disk(output_dir, finished_symbols)
+    agg_overwatch_df = build_aggregated_overwatch_from_disk(output_dir, loaded_symbols)
     agg_overwatch_df.to_csv(
         os.path.join(output_dir, "aggregated_overwatch.csv"),
         index=False
@@ -2928,6 +3045,7 @@ def main_loop(agent_params, train_files, test_files, output_dir, *,
         dates=agg_curve_df["Date"].tolist(),
         save_path=os.path.join(output_dir, "aggregated_curve.html")
     )
+    return finished_symbols
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2935,14 +3053,18 @@ def main_loop(agent_params, train_files, test_files, output_dir, *,
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     multiprocessing.set_start_method("spawn", force=True)
+    configure_tensorflow_runtime()
     set_global_determinism(CFG.SEED)
 
     os.makedirs(CFG.OUTPUT_DIR, exist_ok=True)
     os.makedirs(CFG.MODEL_DIR, exist_ok=True)
 
-    mgr = multiprocessing.Manager()
-    log_q = mgr.Queue()
-    threading.Thread(target=logging_listener, args=(log_q,), daemon=True).start()
+    log_q = None
+    mgr = None
+    if bool(getattr(CFG, "USE_MULTIPROCESSING", False)) and int(getattr(CFG, "NUMBER_OF_POOLS", 1)) > 1:
+        mgr = multiprocessing.Manager()
+        log_q = mgr.Queue()
+        threading.Thread(target=logging_listener, args=(log_q,), daemon=True).start()
     reset_overwatch_chart_storage(log_q)
 
     print(f"Replay buffer reset policy: {describe_memory_reset_policy()}")
@@ -2951,10 +3073,36 @@ if __name__ == "__main__":
     print(f"Resume from checkpoint: {CFG.RESUME_FROM_CHECKPOINT}")
     print(f"Reuse saved scaler: {CFG.REUSE_SAVED_SCALER}")
 
-    train_files = list(CFG.TRAIN_FILES)
-    test_files = list(CFG.TEST_FILES)
+    completed_symbols = normalize_symbol_list(getattr(CFG, "COMPLETED_SYMBOLS", []))
+    batch_limit = max(0, int(getattr(CFG, "BATCH_SYMBOL_LIMIT", 0)))
+
+    all_pairs = [
+        (symbol_from_csv_path(tr), tr, te)
+        for tr, te in zip(CFG.TRAIN_FILES, CFG.TEST_FILES)
+    ]
+    remaining_pairs = [(sym, tr, te) for sym, tr, te in all_pairs if sym not in set(completed_symbols)]
+    if batch_limit > 0:
+        selected_pairs = remaining_pairs[:batch_limit]
+    else:
+        selected_pairs = remaining_pairs
+
+    train_files = [tr for _, tr, _ in selected_pairs]
+    test_files = [te for _, _, te in selected_pairs]
+    batch_symbols = [sym for sym, _, _ in selected_pairs]
 
     print(f"Workers: {min(len(train_files), CFG.NUMBER_OF_POOLS)}")
+    print(f"Use multiprocessing: {CFG.USE_MULTIPROCESSING}")
+    print(f"Already completed: {len(completed_symbols)}")
+    print(f"Remaining symbols: {len(remaining_pairs)}")
+    print(f"Batch limit: {batch_limit if batch_limit > 0 else 'ALL'}")
+    print(f"Current batch symbols ({len(batch_symbols)}): {batch_symbols}")
+
+    if not train_files:
+        print("No symbols left to run for this batch.")
+        if log_q is not None:
+            log_q.put("END")
+        gc.collect()
+        raise SystemExit(0)
 
     output_dir = str(CFG.OUTPUT_DIR)
     window_size = int(CFG.WINDOW_SIZE)
@@ -2979,7 +3127,7 @@ if __name__ == "__main__":
     }
 
     start_time = time.time()
-    main_loop(
+    finished_batch = main_loop(
         agent_parameters,
         train_files,
         test_files,
@@ -2987,13 +3135,25 @@ if __name__ == "__main__":
         window_size=window_size,
         episodes=episodes,
         initial_cash=initial_cash,
-        log_queue=log_q
+        log_queue=log_q,
+        precompleted_symbols=completed_symbols,
     )
+    finished_batch = normalize_symbol_list(finished_batch)
+    updated_completed = normalize_symbol_list(completed_symbols + finished_batch)
+    write_batch_progress_files(output_dir, updated_completed, finished_batch)
+
+    print(f"Finished batch symbols ({len(finished_batch)}): {finished_batch}")
+    print("\nPaste this into CFG.COMPLETED_SYMBOLS for the next restart:")
+    print("COMPLETED_SYMBOLS = [")
+    for symbol in updated_completed:
+        print(f'    "{symbol}",')
+    print("]")
 
     elapsed = time.time() - start_time
     h, rem = divmod(elapsed, 3600)
     m, _ = divmod(rem, 60)
     print(f"Total runtime: {int(h)}h {int(m)}m")
 
-    log_q.put("END")
+    if log_q is not None:
+        log_q.put("END")
     gc.collect()
