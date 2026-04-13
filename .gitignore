@@ -125,6 +125,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv-spark/
 env/
 venv/
 ENV/

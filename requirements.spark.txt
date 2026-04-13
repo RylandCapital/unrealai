@@ -1,0 +1,11 @@
+--extra-index-url=https://pypi.ngc.nvidia.com/
+
+numpy==1.26.4
+pandas==3.0.2
+matplotlib==3.10.8
+plotly==6.7.0
+gym==0.26.2
+psutil==7.2.2
+python-dotenv==1.2.2
+openai==2.31.0
+nvidia-tensorflow==2.17.0+nv25.2

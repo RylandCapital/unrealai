@@ -10,6 +10,7 @@ os.environ.setdefault("TF_DETERMINISTIC_OPS", "0")
 os.environ.setdefault("PYTHONHASHSEED", "42")
 os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
+os.environ.setdefault("GYM_DISABLE_WARNINGS", "1")
 
 import io
 import random
@@ -34,11 +35,12 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-import gym
-from gym import spaces
-
 _STDERR_NOISE_PATTERNS = (
-    b"'+ptx85' is not a recognized feature for this target",
+    b"ptx85",
+    b"Gym has been unmaintained since 2022",
+    b"Please upgrade to Gymnasium",
+    b"Users of this version of Gym",
+    b"See the migration guide",
     b"successful NUMA node read from SysFS had negative value (-1)",
     b"Unable to register cuFFT factory",
     b"Unable to register cuDNN factory",
@@ -100,6 +102,9 @@ _prepend_env_path(
 )
 _install_stderr_filter(_STDERR_NOISE_PATTERNS)
 
+import gym
+from gym import spaces
+
 import tensorflow as tf
 from tensorflow.keras import optimizers
 from tensorflow.keras import mixed_precision
@@ -126,7 +131,8 @@ APP_DIR = Path(__file__).resolve().parent
 # ─────────────────────────────────────────────────────────────────────────────
 class CFG:
 
-    # Spark-friendly default: one trainer process feeding one GPU.
+    # Spark-friendly controls. Keep USE_MULTIPROCESSING=True only when you
+    # intentionally want multiple worker processes sharing the same GPU.
     USE_MULTIPROCESSING = True
     NUMBER_OF_POOLS = 12
     TASKS_PER_CHILD = 1
@@ -151,16 +157,16 @@ class CFG:
     COOLDOWN_DAYS_AFTER_STOP_EXIT = 1
     COOLDOWN_DAYS_AFTER_TAKE_PROFIT_EXIT = 0
 
-    MOMENTUM_HOLD_BONUS = 0.00050
-    MOMENTUM_FLAT_PENALTY = 0.00050
-    MOMENTUM_PREMATURE_CLOSE_PENALTY = 0.00050
+    MOMENTUM_HOLD_BONUS = 0.0005
+    MOMENTUM_FLAT_PENALTY = 0.0005
+    MOMENTUM_PREMATURE_CLOSE_PENALTY = 0.0005
 
     OVERWATCH_ENABLED_TRAIN = False
     OVERWATCH_ENABLED_TEST = False
     OVERWATCH_EVERY_N_STEPS = 5
     OVERWATCH_ALLOW_CONSTRAINT_OVERRIDE = True
     SAVE_OVERWATCH_CHARTS = True
-    OVERWATCH_CHARTS_DIR = str(APP_DIR / "overwatch_charts" / "main_w_llm_full_train_spark")
+    OVERWATCH_CHARTS_DIR = str(APP_DIR / "overwatch_charts" / "main_w_llm_spark")
 
     TRADE_OPEN_PENALTY_TRAIN = 0.0000
     TRADE_OPEN_PENALTY_TEST = 0.0000
@@ -172,48 +178,10 @@ class CFG:
     STOP_LOSS_TEST = .15
     TAKE_PROFIT_TEST = 1000.0
 
+    TRAIN_ROLLING_YEARS = 2
+    TRAIN_ROLLING_STEP_YEARS = 1
     TRAIN_RANDOM_START_MAX = 55
-    EPISODE_EPSILON_START = 1.00
-    EPISODE_EPSILON_END = 0.00
     BATCH_SYMBOL_LIMIT = 12
-    COMPLETED_SYMBOLS = [
-    "ABBV",
-    "AEM",
-    "AMAT",
-    "AMD",
-    "AMGN",
-    "AMZN",
-    "AVGO",
-    "AXP",
-    "CAT",
-    "CME",
-    "COST",
-    "CSCO",
-    "CVX",
-    "DUK",
-    "EXC",
-    "FDX",
-    "GOOGL",
-    "GS",
-    "IBM",
-    "INTC",
-    "INTU",
-    "JPM",
-    "KO",
-    "LIN",
-    "LLY",
-    "LRCX",
-    "MCD",
-    "MDT",
-    "META",
-    "MPC",
-    "MRK",
-    "MU",
-    "NFLX",
-    "NSC",
-    "NVDA",
-    "PANW",
-]
     WRITE_BATCH_PROGRESS_FILES = True
 
     # Replay buffer reset policy
@@ -225,11 +193,11 @@ class CFG:
     TRAIN_MEMORY_RESET_ONCE_AT_EPISODE = 20
 
     # main toggles for speed.
-    TRAIN_REPLAY_EVERY_N_STEPS = 34
-    BATCHSIZE = 55
+    TRAIN_REPLAY_EVERY_N_STEPS = 21
+    BATCHSIZE = 64
     WINDOW_SIZE = 21
-    EPISODES = 50
-    GREEDY_EVAL_EVERY = 7
+    EPISODES = 200
+    GREEDY_EVAL_EVERY = 20
 
     REWARD_ROLLING_MEDIAN_WINDOW = 10
     GREEDY_EVAL_MAX_WINDOWS = None
@@ -711,11 +679,9 @@ def write_batch_progress_files(output_dir: str, completed_symbols: list[str], fi
     with open(root / "batch_progress.json", "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
-    with open(root / "completed_symbols_for_config.txt", "w", encoding="utf-8") as f:
-        f.write("COMPLETED_SYMBOLS = [\n")
+    with open(root / "completed_symbols_this_run.txt", "w", encoding="utf-8") as f:
         for symbol in completed_symbols:
-            f.write(f'    "{symbol}",\n')
-        f.write("]\n")
+            f.write(f"{symbol}\n")
 
 
 def save_overwatch_chart(fig, *, symbol: str, review_date: str, step: int, raw_action: int, source_tag: str) -> str | None:
@@ -860,6 +826,55 @@ def reset_overwatch_chart_storage(log_queue=None) -> None:
 
 def get_ram_usage():
     return psutil.virtual_memory().percent
+
+
+def make_rolling_windows(df: pd.DataFrame,
+                         *,
+                         years: int = 2,
+                         step_years: int = 1,
+                         trading_days_per_year: int = 252):
+    if df is None or df.empty:
+        return []
+
+    window_len = int(years * trading_days_per_year)
+    step_len = int(step_years * trading_days_per_year)
+
+    n = len(df)
+    if n <= window_len:
+        return [(0, n)]
+
+    windows = []
+    start = 0
+    while start + window_len <= n:
+        windows.append((start, start + window_len))
+        start += step_len
+
+    if windows and windows[-1][1] < n:
+        end = n
+        start = max(0, end - window_len)
+        if not windows or windows[-1] != (start, end):
+            windows.append((start, end))
+
+    uniq = []
+    seen = set()
+    for s, e in windows:
+        key = (int(s), int(e))
+        if key not in seen and e - s > 10:
+            uniq.append(key)
+            seen.add(key)
+
+    return uniq
+
+
+def select_fixed_eval_windows(windows, max_windows=None):
+    windows = list(windows or [])
+    if not windows:
+        return []
+    if max_windows is None or len(windows) <= int(max_windows):
+        return windows
+    idxs = np.linspace(0, len(windows) - 1, num=int(max_windows), dtype=int)
+    idxs = sorted(set(int(i) for i in idxs))
+    return [windows[i] for i in idxs]
 
 
 def first_existing_col(cols, candidates):
@@ -2184,9 +2199,16 @@ def train_agent_on_df(agent, df, *, episodes=10, window_size=20,
     eval_episodes = []
     eval_rewards = []
 
-    windows = [(0, len(df))]
+    windows = make_rolling_windows(
+        df,
+        years=int(CFG.TRAIN_ROLLING_YEARS),
+        step_years=int(CFG.TRAIN_ROLLING_STEP_YEARS),
+        trading_days_per_year=252
+    )
+    if not windows:
+        windows = [(0, len(df))]
 
-    fixed_eval_windows = list(windows)
+    fixed_eval_windows = select_fixed_eval_windows(windows, CFG.GREEDY_EVAL_MAX_WINDOWS)
 
     csv_file = open(report_csv_path, "w", newline="") if report_csv_path else None
     csv_writer = None
@@ -2201,18 +2223,16 @@ def train_agent_on_df(agent, df, *, episodes=10, window_size=20,
     def _episode_epsilon(ep_num_1_based: int) -> float:
         total_eps = max(1, int(episodes))
         ep = min(max(1, int(ep_num_1_based)), total_eps)
-        if total_eps == 1:
-            return float(getattr(CFG, "EPISODE_EPSILON_END", 0.0))
-        return float(
-            np.interp(
-                ep,
-                [1, total_eps],
-                [
-                    float(getattr(CFG, "EPISODE_EPSILON_START", 1.0)),
-                    float(getattr(CFG, "EPISODE_EPSILON_END", 0.0)),
-                ],
-            )
-        )
+        min_epsilon = float(getattr(CFG, "EPSILON_MIN", 0.02))
+        final_hold_episodes = min(20, total_eps)
+        decay_end_ep = max(1, total_eps - final_hold_episodes)
+
+        if ep > decay_end_ep:
+            return min_epsilon
+        if decay_end_ep == 1:
+            return min_epsilon
+
+        return float(np.interp(ep, [1, decay_end_ep], [1.00, min_epsilon]))
 
     train_every = max(1, int(CFG.TRAIN_REPLAY_EVERY_N_STEPS))
     agent.overwatch_enabled = False
@@ -2220,15 +2240,9 @@ def train_agent_on_df(agent, df, *, episodes=10, window_size=20,
     child_log(log_queue, f"[{symbol}] Replay reset policy: {describe_memory_reset_policy()}")
     child_log(
         log_queue,
-        f"[{symbol}] Episode epsilon schedule: "
-        f"{float(getattr(CFG, 'EPISODE_EPSILON_START', 1.0)):.2f} -> "
-        f"{float(getattr(CFG, 'EPISODE_EPSILON_END', 0.0)):.2f} "
-        f"over {int(episodes)} episodes"
-    )
-    child_log(
-        log_queue,
-        f"[{symbol}] Training mode: full dataset per episode "
-        f"(random start max={int(CFG.TRAIN_RANDOM_START_MAX)} bars)"
+        f"[{symbol}] Episode epsilon schedule: 1.00 -> 0.02 over "
+        f"{max(1, int(episodes) - min(20, int(episodes)))} episodes; "
+        f"hold 0.02 for final {min(20, int(episodes))} episodes"
     )
 
     for e in range(episodes):
@@ -2784,6 +2798,8 @@ def build_aggregated_overwatch_from_disk(output_dir, symbols):
         p = os.path.join(output_dir, f"{sym}_overwatch.csv")
         if not os.path.exists(p):
             continue
+        if os.path.getsize(p) == 0:
+            continue
 
         try:
             df = pd.read_csv(p)
@@ -3044,6 +3060,7 @@ def main_loop(agent_params, train_files, test_files, output_dir, *,
 
     child_log(log_queue, f"Loaded {len(results)} symbol result sets from disk")
     if not results:
+        child_log(log_queue, "No symbol result sets available for aggregation.")
         return finished_symbols
 
     agg_dates_bh, agg_bh, _ = build_real_multiasset_portfolio(
@@ -3149,6 +3166,7 @@ def main_loop(agent_params, train_files, test_files, output_dir, *,
         dates=agg_curve_df["Date"].tolist(),
         save_path=os.path.join(output_dir, "aggregated_curve.html")
     )
+
     return finished_symbols
 
 
@@ -3177,7 +3195,12 @@ if __name__ == "__main__":
     print(f"Resume from checkpoint: {CFG.RESUME_FROM_CHECKPOINT}")
     print(f"Reuse saved scaler: {CFG.REUSE_SAVED_SCALER}")
 
-    completed_symbols = normalize_symbol_list(getattr(CFG, "COMPLETED_SYMBOLS", []))
+    output_dir = str(CFG.OUTPUT_DIR)
+    window_size = int(CFG.WINDOW_SIZE)
+    episodes = int(CFG.EPISODES)
+    initial_cash = float(CFG.INITIAL_CASH)
+
+    completed_symbols = []
     batch_limit = max(0, int(getattr(CFG, "BATCH_SYMBOL_LIMIT", 0)))
 
     all_pairs = [
@@ -3185,35 +3208,19 @@ if __name__ == "__main__":
         for tr, te in zip(CFG.TRAIN_FILES, CFG.TEST_FILES)
     ]
     remaining_pairs = [(sym, tr, te) for sym, tr, te in all_pairs if sym not in set(completed_symbols)]
-    if batch_limit > 0:
-        selected_pairs = remaining_pairs[:batch_limit]
-    else:
-        selected_pairs = remaining_pairs
 
-    train_files = [tr for _, tr, _ in selected_pairs]
-    test_files = [te for _, _, te in selected_pairs]
-    batch_symbols = [sym for sym, _, _ in selected_pairs]
-
-    print(f"Workers: {min(len(train_files), CFG.NUMBER_OF_POOLS)}")
     print(f"Use multiprocessing: {CFG.USE_MULTIPROCESSING}")
-    print(f"Already completed: {len(completed_symbols)}")
-    print(f"Remaining symbols: {len(remaining_pairs)}")
-    print(f"Batch limit: {batch_limit if batch_limit > 0 else 'ALL'}")
-    print(f"Current batch symbols ({len(batch_symbols)}): {batch_symbols}")
+    print(f"Total symbols: {len(all_pairs)}")
+    print(f"Symbols to run: {len(remaining_pairs)}")
+    print(f"Batch size: {batch_limit if batch_limit > 0 else 'ALL'}")
 
-    if not train_files:
-        print("No symbols left to run for this batch.")
+    if not remaining_pairs:
+        print("No symbols left to run.")
         if log_q is not None:
             log_q.put("END")
-        gc.collect()
         raise SystemExit(0)
 
-    output_dir = str(CFG.OUTPUT_DIR)
-    window_size = int(CFG.WINDOW_SIZE)
-    episodes = int(CFG.EPISODES)
-    initial_cash = float(CFG.INITIAL_CASH)
-
-    dummy_df = load_csv(train_files[0], require_eval_prices=False)
+    dummy_df = load_csv(remaining_pairs[0][1], require_eval_prices=False)
     tmp_env = TradingEnv(dummy_df, window_size=window_size, min_hold_days=int(CFG.MIN_HOLD_DAYS))
     state_size = tmp_env.observation_space.shape
     action_size = tmp_env.action_space.n
@@ -3231,32 +3238,60 @@ if __name__ == "__main__":
     }
 
     start_time = time.time()
-    finished_batch = main_loop(
-        agent_parameters,
-        train_files,
-        test_files,
-        output_dir,
-        window_size=window_size,
-        episodes=episodes,
-        initial_cash=initial_cash,
-        log_queue=log_q,
-        precompleted_symbols=completed_symbols,
-    )
-    finished_batch = normalize_symbol_list(finished_batch)
-    updated_completed = normalize_symbol_list(completed_symbols + finished_batch)
-    write_batch_progress_files(output_dir, updated_completed, finished_batch)
+    finished_this_run = []
+    batch_index = 0
 
-    print(f"Finished batch symbols ({len(finished_batch)}): {finished_batch}")
-    print("\nPaste this into CFG.COMPLETED_SYMBOLS for the next restart:")
-    print("COMPLETED_SYMBOLS = [")
-    for symbol in updated_completed:
-        print(f'    "{symbol}",')
-    print("]")
+    while True:
+        completed_set = set(completed_symbols)
+        remaining_pairs = [(sym, tr, te) for sym, tr, te in all_pairs if sym not in completed_set]
+        if not remaining_pairs:
+            print("All symbols completed.")
+            break
+
+        batch_index += 1
+        if batch_limit > 0:
+            selected_pairs = remaining_pairs[:batch_limit]
+        else:
+            selected_pairs = remaining_pairs
+
+        train_files = [tr for _, tr, _ in selected_pairs]
+        test_files = [te for _, _, te in selected_pairs]
+        batch_symbols = [sym for sym, _, _ in selected_pairs]
+
+        print(f"\n=== Batch {batch_index} ===")
+        print(f"Workers: {min(len(train_files), CFG.NUMBER_OF_POOLS)}")
+        print(f"Completed before batch: {len(completed_symbols)}")
+        print(f"Remaining before batch: {len(remaining_pairs)}")
+        print(f"Current batch symbols ({len(batch_symbols)}): {batch_symbols}")
+
+        finished_batch = main_loop(
+            agent_parameters,
+            train_files,
+            test_files,
+            output_dir,
+            window_size=window_size,
+            episodes=episodes,
+            initial_cash=initial_cash,
+            log_queue=log_q,
+            precompleted_symbols=completed_symbols,
+        )
+        finished_batch = normalize_symbol_list(finished_batch)
+        if not finished_batch:
+            print("No symbols finished in this batch; stopping to avoid an infinite loop.")
+            break
+
+        finished_this_run = normalize_symbol_list(finished_this_run + finished_batch)
+        completed_symbols = normalize_symbol_list(completed_symbols + finished_batch)
+        write_batch_progress_files(output_dir, completed_symbols, finished_batch)
+
+        if batch_limit <= 0:
+            break
 
     elapsed = time.time() - start_time
     h, rem = divmod(elapsed, 3600)
     m, _ = divmod(rem, 60)
     print(f"Total runtime: {int(h)}h {int(m)}m")
+    print(f"Finished this run ({len(finished_this_run)}): {finished_this_run}")
 
     if log_q is not None:
         log_q.put("END")
