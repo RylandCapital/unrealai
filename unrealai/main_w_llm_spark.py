@@ -1737,32 +1737,70 @@ class DQNAgent:
 
         every_n = max(1, int(CFG.OVERWATCH_EVERY_N_STEPS))
         if allow_overwatch and (self.overwatch_counter % every_n == 0):
-            chart_module = get_chart_module()
-            fig = chart_module.build_fig(symbol, end=env.current_datetime.strftime("%Y-%m-%d"))
+            chart_path = ""
+            try:
+                chart_module = get_chart_module()
+                fig = chart_module.build_fig(symbol, end=env.current_datetime.strftime("%Y-%m-%d"))
+                if fig is None:
+                    raise RuntimeError("Overwatch chart builder returned None")
 
-            fig.text(
-                0.01, 0.99, build_overwatch_decision_card(env, raw_action=int(raw_action), valid_actions=valid_actions),
-                va="top", ha="left",
-                color="white", fontsize=8,
-                bbox=dict(facecolor="black", alpha=0.6)
-            )
+                fig.text(
+                    0.01, 0.99, build_overwatch_decision_card(env, raw_action=int(raw_action), valid_actions=valid_actions),
+                    va="top", ha="left",
+                    color="white", fontsize=8,
+                    bbox=dict(facecolor="black", alpha=0.6)
+                )
 
-            chart_path = save_overwatch_chart(
-                fig,
-                symbol=symbol,
-                review_date=env.current_datetime.strftime("%Y-%m-%d"),
-                step=int(env.current_step),
-                raw_action=int(raw_action),
-                source_tag="overwatch",
-            )
-            img_bytes = fig_to_bytes(fig)
-            plt.close(fig)
+                chart_path = save_overwatch_chart(
+                    fig,
+                    symbol=symbol,
+                    review_date=env.current_datetime.strftime("%Y-%m-%d"),
+                    step=int(env.current_step),
+                    raw_action=int(raw_action),
+                    source_tag="overwatch",
+                )
+                img_bytes = fig_to_bytes(fig)
+                plt.close(fig)
 
-            img_b64_str = base64.b64encode(img_bytes).decode("utf-8")
+                img_b64_str = base64.b64encode(img_bytes).decode("utf-8")
+            except Exception as e:
+                try:
+                    plt.close("all")
+                except Exception:
+                    pass
+                print(
+                    f"[OVERWATCH] {symbol} {env.current_datetime.strftime('%Y-%m-%d')} "
+                    f"step={int(env.current_step)} chart setup failed: {e}",
+                    flush=True,
+                )
+                self.overwatch_logs.append({
+                    "symbol": symbol,
+                    "step": int(env.current_step),
+                    "date": env.current_datetime.strftime("%Y-%m-%d"),
+                    "position": int(env.position),
+                    "cooldown_remaining": int(getattr(env, "cooldown_remaining", 0)),
+                    "valid_actions": ",".join(map(str, valid_actions)),
+                    "raw_action": int(raw_action),
+                    "final_action": int(raw_action),
+                    "overrode": False,
+                    "model_action": None,
+                    "model_reply": "",
+                    "model_action_invalid": False,
+                    "constraint_override": False,
+                    "constraint_override_reason": "",
+                    "chart_path": chart_path or "",
+                    "error": f"chart_setup_failed: {e}",
+                })
+                return raw_action
 
             try:
                 resp_txt = overwatch_decision(raw_action, img_b64_str)
             except Exception as e:
+                print(
+                    f"[OVERWATCH] {symbol} {env.current_datetime.strftime('%Y-%m-%d')} "
+                    f"step={int(env.current_step)} decision failed: {e}",
+                    flush=True,
+                )
                 self.overwatch_logs.append({
                     "symbol": symbol,
                     "step": int(env.current_step),
@@ -2235,7 +2273,7 @@ def train_agent_on_df(agent, df, *, episodes=10, window_size=20,
         return float(np.interp(ep, [1, decay_end_ep], [1.00, min_epsilon]))
 
     train_every = max(1, int(CFG.TRAIN_REPLAY_EVERY_N_STEPS))
-    agent.overwatch_enabled = False
+    agent.overwatch_enabled = bool(CFG.OVERWATCH_ENABLED_TRAIN)
 
     child_log(log_queue, f"[{symbol}] Replay reset policy: {describe_memory_reset_policy()}")
     child_log(
@@ -2269,7 +2307,12 @@ def train_agent_on_df(agent, df, *, episodes=10, window_size=20,
         in_market_steps = 0
 
         while True:
-            action = agent.act(state, env=env, symbol=symbol, use_overwatch=False)
+            action = agent.act(
+                state,
+                env=env,
+                symbol=symbol,
+                use_overwatch=bool(CFG.OVERWATCH_ENABLED_TRAIN),
+            )
             next_state, reward, done, _ = env.step(action)
 
             agent.remember(state, action, reward, next_state, done)

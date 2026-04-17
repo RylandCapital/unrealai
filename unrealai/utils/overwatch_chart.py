@@ -1,6 +1,8 @@
 import warnings
-import norgatedata
+import os
+import platform
 import datetime as dt
+from pathlib import Path
 import pandas as pd
 import numpy as np
 import mplfinance as mpf
@@ -8,7 +10,11 @@ import matplotlib.pyplot as plt
 
 from matplotlib.backends.backend_pdf import PdfPages
 from dateutil.relativedelta import relativedelta
-from scipy.signal import argrelextrema
+
+try:
+    import norgatedata
+except ModuleNotFoundError:
+    norgatedata = None
 
 
 # =============================================================================
@@ -57,6 +63,8 @@ SECTOR_NAME_TO_ETF = {
 
 PRICE_CACHE = {}
 _SECTOR_LOOKUP_CACHE = None
+MODULE_DIR = Path(__file__).resolve().parent
+APP_DIR = MODULE_DIR.parent
 
 
 # =============================================================================
@@ -101,6 +109,89 @@ def dedupe_preserve_order(items):
             seen.add(item)
             out.append(item)
     return out
+
+
+def local_extrema(values, comparator, order):
+    """
+    Small scipy-free replacement for argrelextrema over 1D close prices.
+    A point is an extrema when it satisfies comparator against neighbors inside
+    the requested order window.
+    """
+    values = np.asarray(values, dtype=float)
+    order = max(1, int(order))
+    if len(values) == 0:
+        return np.array([], dtype=int)
+
+    out = []
+    for idx, value in enumerate(values):
+        left = values[max(0, idx - order):idx]
+        right = values[idx + 1:idx + order + 1]
+        neighbors = np.concatenate([left, right])
+        if len(neighbors) and bool(np.all(comparator(value, neighbors))):
+            out.append(idx)
+    return np.asarray(out, dtype=int)
+
+
+def price_source_mode():
+    return os.getenv("OVERWATCH_PRICE_SOURCE", "auto").strip().lower()
+
+
+def norgate_available_for_this_host():
+    if norgatedata is None:
+        return False
+    return platform.system().lower() == "windows"
+
+
+def local_price_data_dirs():
+    raw = os.getenv("OVERWATCH_PRICE_DATA_DIRS")
+    if raw:
+        return [Path(p).expanduser() for p in raw.split(os.pathsep) if p.strip()]
+    return [APP_DIR / "traindata", APP_DIR / "testdata"]
+
+
+def find_local_price_csv(symbol):
+    symbol = str(symbol).strip().upper()
+    for root in local_price_data_dirs():
+        path = root / f"{symbol}.csv"
+        if path.exists():
+            yield path
+
+
+def fetch_local_price_history(symbol, years_back=YEARS_BACK, end=None):
+    symbol = str(symbol).strip().upper()
+    end_ts = normalize_end_date(end)
+    start_ts = end_ts - relativedelta(years=years_back)
+
+    frames = []
+    wanted_cols = {
+        "Date", "Open", "High", "Low", "Close", "Volume",
+        "spy_Close", "spy_adjusted_close",
+        "sector_Close", "sector_adjusted_close",
+    }
+    for path in find_local_price_csv(symbol):
+        try:
+            raw = pd.read_csv(
+                path,
+                usecols=lambda col: str(col).strip() in wanted_cols,
+            )
+        except Exception as e:
+            print(f"Failed to read local price CSV for {symbol} at {path}: {e}")
+            continue
+
+        df = standardize_ohlcv(raw, keep_extra=True)
+        if df is not None and not df.empty:
+            frames.append(df)
+
+    if not frames:
+        return None
+
+    df = pd.concat(frames, ignore_index=True)
+    df.sort_values("Date", inplace=True)
+    df.drop_duplicates(subset="Date", keep="last", inplace=True)
+    df = df[(df["Date"] >= start_ts) & (df["Date"] <= end_ts)].copy()
+    df.reset_index(drop=True, inplace=True)
+
+    return None if df.empty else df
 
 
 def fmt_px(x):
@@ -153,7 +244,7 @@ def resolve_sector_benchmark(ticker, sector_value=None):
     return sector_etf
 
 
-def standardize_ohlcv(df):
+def standardize_ohlcv(df, keep_extra=False):
     """
     Force standard columns: Date/Open/High/Low/Close/Volume
     """
@@ -190,7 +281,11 @@ def standardize_ohlcv(df):
         print(f"Missing columns after standardization: {missing}")
         return None
 
-    df = df[required].copy()
+    if keep_extra:
+        extra_cols = [c for c in df.columns if c not in required]
+        df = df[required + extra_cols].copy()
+    else:
+        df = df[required].copy()
     df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
 
     for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
@@ -206,30 +301,42 @@ def standardize_ohlcv(df):
 
 def fetch_price_history(symbol, years_back=YEARS_BACK, end=None):
     """
-    Pull adjusted price history from Norgate and truncate it to the requested
-    point-in-time end date.
+    Pull adjusted price history and truncate it to the requested point-in-time
+    end date. Windows desktops can use Norgate directly; Spark/Linux falls back
+    to local train/test CSVs generated from the same feature pipeline.
     """
     symbol = str(symbol).strip().upper()
     end_ts = normalize_end_date(end)
     start_ts = end_ts - relativedelta(years=years_back)
 
-    cache_key = (symbol, int(years_back), end_ts.strftime("%Y-%m-%d"))
+    source_mode = price_source_mode()
+    cache_key = (symbol, int(years_back), end_ts.strftime("%Y-%m-%d"), source_mode)
     if cache_key in PRICE_CACHE:
         return PRICE_CACHE[cache_key].copy()
 
-    try:
-        raw = norgatedata.price_timeseries(
-            symbol,
-            stock_price_adjustment_setting=norgatedata.StockPriceAdjustmentType.TOTALRETURN,
-            padding_setting=norgatedata.PaddingType.NONE,
-            start_date=pd.Timestamp(start_ts.date()),
-            timeseriesformat='pandas-dataframe'
-        )
-    except Exception as e:
-        print(f"Failed to retrieve data for {symbol}: {e}")
-        return None
+    df = None
+    use_norgate_first = source_mode == "norgate" or (source_mode == "auto" and norgate_available_for_this_host())
 
-    df = standardize_ohlcv(raw)
+    if use_norgate_first:
+        if norgatedata is None:
+            print(f"Norgate requested for {symbol}, but Python package norgatedata is not installed.")
+        else:
+            try:
+                raw = norgatedata.price_timeseries(
+                    symbol,
+                    stock_price_adjustment_setting=norgatedata.StockPriceAdjustmentType.TOTALRETURN,
+                    padding_setting=norgatedata.PaddingType.NONE,
+                    start_date=pd.Timestamp(start_ts.date()),
+                    timeseriesformat='pandas-dataframe'
+                )
+                df = standardize_ohlcv(raw)
+            except Exception as e:
+                print(f"Failed to retrieve Norgate data for {symbol}: {e}")
+
+    if df is None or df.empty:
+        if source_mode != "norgate":
+            df = fetch_local_price_history(symbol, years_back=years_back, end=end_ts)
+
     if df is None or df.empty:
         print(f"No valid OHLCV data returned for {symbol}")
         return None
@@ -256,15 +363,25 @@ def resample_ohlc(df, freq):
     if 'Date' in df2.columns:
         df2 = df2.set_index('Date')
 
-    out = df2.resample(freq).agg({
-        'Open': 'first',
-        'High': 'max',
-        'Low': 'min',
-        'Close': 'last',
-        'Volume': 'sum'
-    }).dropna()
+    freqs_to_try = ['ME', 'M'] if freq == 'M' else [freq]
+    last_error = None
+    for resample_freq in freqs_to_try:
+        try:
+            out = df2.resample(resample_freq).agg({
+                'Open': 'first',
+                'High': 'max',
+                'Low': 'min',
+                'Close': 'last',
+                'Volume': 'sum'
+            }).dropna()
+            return out
+        except ValueError as e:
+            last_error = e
+            continue
 
-    return out
+    if last_error is not None:
+        raise last_error
+    return None
 
 
 def anchored_vwap(df, start_loc, price_col='Close', volume_col='Volume'):
@@ -301,8 +418,8 @@ def calculate_vwap_indicators(df_daily, swing_order=SWING_ORDER):
 
     close_vals = df['Close'].values
 
-    max_idx = argrelextrema(close_vals, np.greater_equal, order=swing_order)[0]
-    min_idx = argrelextrema(close_vals, np.less_equal, order=swing_order)[0]
+    max_idx = local_extrema(close_vals, np.greater_equal, swing_order)
+    min_idx = local_extrema(close_vals, np.less_equal, swing_order)
 
     if len(max_idx) == 0:
         max_anchor_loc = int(df['Close'].idxmax())
@@ -372,17 +489,45 @@ def close_series_from_df(df):
     return None
 
 
+def close_series_from_prefixed_columns(df, prefix):
+    """
+    Return a Date-indexed close series from embedded benchmark columns such as
+    spy_Close or sector_Close in the local training CSVs.
+    """
+    if df is None or df.empty or 'Date' not in df.columns:
+        return None
+
+    close_col = f"{prefix}_Close"
+    adjusted_col = f"{prefix}_adjusted_close"
+    value_col = close_col if close_col in df.columns else adjusted_col
+    if value_col not in df.columns:
+        return None
+
+    out = df[['Date', value_col]].copy()
+    out['Date'] = pd.to_datetime(out['Date'], errors='coerce')
+    out[value_col] = pd.to_numeric(out[value_col], errors='coerce')
+    out.dropna(subset=['Date', value_col], inplace=True)
+    out.sort_values('Date', inplace=True)
+    out.drop_duplicates(subset='Date', keep='last', inplace=True)
+    out.set_index('Date', inplace=True)
+    return out[value_col].astype(float)
+
+
 def compute_relative_strength(stock_df, benchmark_symbol, lookback=RS_LOOKBACK_BARS, end=None):
     """
     3M RS = stock return relative to benchmark return over ~63 trading days,
     using the same as-of end date for both series.
     """
-    benchmark_df = fetch_price_history(benchmark_symbol, years_back=YEARS_BACK, end=end)
-    if benchmark_df is None or benchmark_df.empty:
-        return None
-
     stock_close = close_series_from_df(stock_df)
-    bench_close = close_series_from_df(benchmark_df)
+    bench_close = None
+    benchmark_symbol = str(benchmark_symbol).strip().upper()
+
+    if benchmark_symbol == 'SPY':
+        bench_close = close_series_from_prefixed_columns(stock_df, 'spy')
+
+    if bench_close is None and benchmark_symbol not in {'', 'NONE'}:
+        benchmark_df = fetch_price_history(benchmark_symbol, years_back=YEARS_BACK, end=end)
+        bench_close = close_series_from_df(benchmark_df)
 
     if stock_close is None or bench_close is None:
         return None
@@ -406,6 +551,41 @@ def compute_relative_strength(stock_df, benchmark_symbol, lookback=RS_LOOKBACK_B
 
     return {
         'benchmark': benchmark_symbol,
+        'stock_ret': float(stock_ret) if pd.notna(stock_ret) else np.nan,
+        'benchmark_ret': float(bench_ret) if pd.notna(bench_ret) else np.nan,
+        'relative_ret': float(rel_ret) if pd.notna(rel_ret) else np.nan,
+    }
+
+
+def compute_embedded_sector_relative_strength(stock_df, lookback=RS_LOOKBACK_BARS):
+    """
+    Local train/test CSVs include sector_Close but not necessarily the actual
+    sector ETF file. Use the embedded point-in-time sector series when present.
+    """
+    stock_close = close_series_from_df(stock_df)
+    sector_close = close_series_from_prefixed_columns(stock_df, 'sector')
+    if stock_close is None or sector_close is None:
+        return None
+
+    aligned = pd.concat(
+        [stock_close.rename('stock'), sector_close.rename('bench')],
+        axis=1,
+        join='inner'
+    ).dropna()
+
+    if len(aligned) <= lookback:
+        return None
+
+    stock_ret = aligned['stock'].pct_change(lookback).iloc[-1]
+    bench_ret = aligned['bench'].pct_change(lookback).iloc[-1]
+
+    if pd.isna(stock_ret) or pd.isna(bench_ret):
+        rel_ret = np.nan
+    else:
+        rel_ret = (1 + stock_ret) / (1 + bench_ret) - 1
+
+    return {
+        'benchmark': 'Embedded sector',
         'stock_ret': float(stock_ret) if pd.notna(stock_ret) else np.nan,
         'benchmark_ret': float(bench_ret) if pd.notna(bench_ret) else np.nan,
         'relative_ret': float(rel_ret) if pd.notna(rel_ret) else np.nan,
@@ -588,6 +768,11 @@ def plot_three_charts_on_one_page(stock, sector_benchmark=None, end=None):
             sector_benchmark,
             lookback=RS_LOOKBACK_BARS,
             end=end_ts
+        )
+    if rs_sector is None:
+        rs_sector = compute_embedded_sector_relative_strength(
+            df_10yr_daily,
+            lookback=RS_LOOKBACK_BARS
         )
 
     fig = mpf.figure(figsize=(14, 10), style=dark_style_custom)

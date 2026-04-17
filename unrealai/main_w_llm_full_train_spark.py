@@ -20,8 +20,10 @@ import csv
 import json
 import base64
 import multiprocessing
-import shutil
 import threading
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from pathlib import Path
 import importlib.util
@@ -121,6 +123,21 @@ except ModuleNotFoundError:
 load_dotenv()
 APP_DIR = Path(__file__).resolve().parent
 
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or str(value).strip() == "":
+        return int(default)
+    return int(value)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ✅ USER-TUNABLE CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
@@ -128,7 +145,7 @@ class CFG:
 
     # Spark-friendly default: one trainer process feeding one GPU.
     USE_MULTIPROCESSING = True
-    NUMBER_OF_POOLS = 12
+    NUMBER_OF_POOLS = 4
     TASKS_PER_CHILD = 1
     SEED = 42
 
@@ -155,12 +172,31 @@ class CFG:
     MOMENTUM_FLAT_PENALTY = 0.00050
     MOMENTUM_PREMATURE_CLOSE_PENALTY = 0.00050
 
-    OVERWATCH_ENABLED_TRAIN = False
-    OVERWATCH_ENABLED_TEST = False
-    OVERWATCH_EVERY_N_STEPS = 5
+    OVERWATCH_ENABLED_TRAIN = env_bool("OVERWATCH_ENABLED_TRAIN", False)
+    OVERWATCH_ENABLED_TEST = env_bool("OVERWATCH_ENABLED_TEST", True)
+    OVERWATCH_EVERY_N_STEPS = 10
     OVERWATCH_ALLOW_CONSTRAINT_OVERRIDE = True
-    SAVE_OVERWATCH_CHARTS = True
-    OVERWATCH_CHARTS_DIR = str(APP_DIR / "overwatch_charts" / "main_w_llm_full_train_spark")
+    OVERWATCH_COMMITTEE_ENABLED = env_bool("OVERWATCH_COMMITTEE_ENABLED", True)
+    OVERWATCH_COMMITTEE_NEWS_ENABLED = env_bool("OVERWATCH_COMMITTEE_NEWS_ENABLED", True)
+    OVERWATCH_COMMITTEE_DEBATE_ROUNDS = env_int("OVERWATCH_COMMITTEE_DEBATE_ROUNDS", 1)
+    OVERWATCH_COMMITTEE_MAX_AUDIT_CHARS = env_int("OVERWATCH_COMMITTEE_MAX_AUDIT_CHARS", 12000)
+    OVERWATCH_NEWS_MAX_CANDIDATES = env_int("OVERWATCH_NEWS_MAX_CANDIDATES", 5)
+    OVERWATCH_NEWS_MAX_CONTEXT_ARTICLES = env_int("OVERWATCH_NEWS_MAX_CONTEXT_ARTICLES", 5)
+    OVERWATCH_NEWS_MIN_PUBLICATION_LAG_MINUTES = env_int("OVERWATCH_NEWS_MIN_PUBLICATION_LAG_MINUTES", 0)
+    OVERWATCH_NEWS_RETRIEVAL_PROVIDER = os.getenv(
+        "OVERWATCH_NEWS_RETRIEVAL_PROVIDER",
+        os.getenv("NEWS_RETRIEVAL_PROVIDER", "tavily"),
+    ).strip().lower()
+    OVERWATCH_NEWS_RETRIEVAL_MODEL = os.getenv("OVERWATCH_NEWS_RETRIEVAL_MODEL", "gpt-5-mini")
+    OVERWATCH_NEWS_RETRIEVAL_REASONING_EFFORT = os.getenv("OVERWATCH_NEWS_RETRIEVAL_REASONING_EFFORT", "medium")
+    OVERWATCH_LOCAL_AGENT_MODEL = os.getenv("OVERWATCH_LOCAL_AGENT_MODEL", "gemma4:26b")
+    OVERWATCH_TECHNICAL_MODEL = os.getenv("OVERWATCH_TECHNICAL_MODEL", OVERWATCH_LOCAL_AGENT_MODEL)
+    OVERWATCH_CHAIR_MODEL = os.getenv("OVERWATCH_CHAIR_MODEL", OVERWATCH_LOCAL_AGENT_MODEL)
+    OVERWATCH_CHAIR_SEES_CHART_IMAGE = env_bool("OVERWATCH_CHAIR_SEES_CHART_IMAGE", False)
+    OVERWATCH_LOCAL_AGENT_SEES_CHART_IMAGE = env_bool("OVERWATCH_LOCAL_AGENT_SEES_CHART_IMAGE", True)
+    OVERWATCH_LOCAL_AGENT_BASE_URL = os.getenv("OVERWATCH_LOCAL_AGENT_BASE_URL", "http://127.0.0.1:11434")
+    OVERWATCH_LOCAL_AGENT_TIMEOUT_SECONDS = env_int("OVERWATCH_LOCAL_AGENT_TIMEOUT_SECONDS", 480)
+    OVERWATCH_VERBOSE_PROGRESS = env_bool("OVERWATCH_VERBOSE_PROGRESS", True)
 
     TRADE_OPEN_PENALTY_TRAIN = 0.0000
     TRADE_OPEN_PENALTY_TEST = 0.0000
@@ -175,45 +211,6 @@ class CFG:
     TRAIN_RANDOM_START_MAX = 55
     EPISODE_EPSILON_START = 1.00
     EPISODE_EPSILON_END = 0.00
-    BATCH_SYMBOL_LIMIT = 12
-    COMPLETED_SYMBOLS = [
-    "ABBV",
-    "AEM",
-    "AMAT",
-    "AMD",
-    "AMGN",
-    "AMZN",
-    "AVGO",
-    "AXP",
-    "CAT",
-    "CME",
-    "COST",
-    "CSCO",
-    "CVX",
-    "DUK",
-    "EXC",
-    "FDX",
-    "GOOGL",
-    "GS",
-    "IBM",
-    "INTC",
-    "INTU",
-    "JPM",
-    "KO",
-    "LIN",
-    "LLY",
-    "LRCX",
-    "MCD",
-    "MDT",
-    "META",
-    "MPC",
-    "MRK",
-    "MU",
-    "NFLX",
-    "NSC",
-    "NVDA",
-    "PANW",
-]
     WRITE_BATCH_PROGRESS_FILES = True
 
     # Replay buffer reset policy
@@ -228,8 +225,8 @@ class CFG:
     TRAIN_REPLAY_EVERY_N_STEPS = 34
     BATCHSIZE = 55
     WINDOW_SIZE = 21
-    EPISODES = 50
-    GREEDY_EVAL_EVERY = 7
+    EPISODES = 30
+    GREEDY_EVAL_EVERY = 10
 
     REWARD_ROLLING_MEDIAN_WINDOW = 10
     GREEDY_EVAL_MAX_WINDOWS = None
@@ -564,7 +561,7 @@ def load_agent_checkpoint(agent, symbol: str, base_dir: str):
 from openai import OpenAI
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("SECRET")
-OVERWATCH_MODEL = os.getenv("OVERWATCH_MODEL", CFG.MODEL)
+OVERWATCH_MODEL = os.getenv("OVERWATCH_MODEL", str(getattr(CFG, "OVERWATCH_LOCAL_AGENT_MODEL", CFG.MODEL)))
 
 
 def _get_openai_client():
@@ -576,8 +573,6 @@ def _get_openai_client():
 
 
 def overwatch_decision(raw_action: int, img_b64_str: str) -> str:
-    client = _get_openai_client()
-
     instructions = (
         "You are lead equity analyst on the tradedesk. You are overseeing a MOMENTUM reinforcement learning trading agent "
         "that decides whether to do hold(0), go long(1), close(2), each day. "
@@ -598,27 +593,425 @@ def overwatch_decision(raw_action: int, img_b64_str: str) -> str:
     )
 
 
-    image_data_url = f"data:image/png;base64,{img_b64_str}"
     payload = {"trading_action": int(raw_action)}
-
-    resp = client.responses.create(
+    return _ollama_chat(
+        [{"role": "user", "content": f"{instructions}\n\nDecision payload:\n{json.dumps(payload)}"}],
         model=OVERWATCH_MODEL,
-        reasoning={"effort": str(CFG.OVERWATCH_REASONING_EFFORT)},
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": instructions},
-                    {"type": "input_text", "text": json.dumps(payload)},
-                    {"type": "input_image", "image_url": image_data_url},
-                ],
-            }
-        ],
+        img_b64_str=img_b64_str,
     )
-    return resp.output_text.strip()
 
 
 overwatch_decision_gpt5mini = overwatch_decision
+
+
+def _truncate_text(text, max_chars: int) -> str:
+    text = "" if text is None else str(text)
+    max_chars = int(max_chars or 0)
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "\n...[truncated]"
+
+
+def _jsonish_payload(payload: dict) -> str:
+    return json.dumps(payload, default=str, indent=2)
+
+
+def _overwatch_progress(symbol: str, as_of: str, step: int | None, message: str) -> None:
+    if not bool(getattr(CFG, "OVERWATCH_VERBOSE_PROGRESS", True)):
+        return
+    step_text = "step=NA" if step is None else f"step={int(step)}"
+    print(
+        f"[OVERWATCH][TEST][COMMITTEE] {symbol} {as_of} {step_text} {message}",
+        flush=True,
+    )
+
+
+def _openai_text_or_vision_call(*, model: str, text: str, img_b64_str: str | None = None, reasoning_effort: str | None = None) -> str:
+    client = _get_openai_client()
+    content = [{"type": "input_text", "text": text}]
+    if img_b64_str:
+        content.append({"type": "input_image", "image_url": f"data:image/png;base64,{img_b64_str}"})
+
+    kwargs = {
+        "model": model,
+        "input": [{"role": "user", "content": content}],
+    }
+    if reasoning_effort:
+        kwargs["reasoning"] = {"effort": str(reasoning_effort)}
+
+    resp = client.responses.create(**kwargs)
+    return resp.output_text.strip()
+
+
+def _ollama_chat(
+    messages: list[dict],
+    *,
+    model: str | None = None,
+    base_url: str | None = None,
+    timeout: int | None = None,
+    img_b64_str: str | None = None,
+) -> str:
+    model = model or str(getattr(CFG, "OVERWATCH_LOCAL_AGENT_MODEL", "gemma4:26b"))
+    base_url = (base_url or str(getattr(CFG, "OVERWATCH_LOCAL_AGENT_BASE_URL", "http://127.0.0.1:11434"))).rstrip("/")
+    timeout = int(timeout or getattr(CFG, "OVERWATCH_LOCAL_AGENT_TIMEOUT_SECONDS", 240))
+    messages = [dict(message) for message in messages]
+    if img_b64_str and bool(getattr(CFG, "OVERWATCH_LOCAL_AGENT_SEES_CHART_IMAGE", True)):
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                message["images"] = [img_b64_str]
+                break
+    payload = json.dumps(
+        {
+            "model": model,
+            "stream": False,
+            "messages": messages,
+            "options": {"temperature": 0.2},
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url}/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Local Ollama call failed for model={model}: {exc}") from exc
+    return str(data.get("message", {}).get("content", "")).strip()
+
+
+def _committee_agent_output_schema() -> str:
+    return (
+        "Return concise JSON only with keys: "
+        "agent, stance, confidence, strongest_evidence, biggest_risk, challenge_to_others, reasoning. "
+        "stance must be one of HOLD, LONG, CLOSE."
+    )
+
+
+def _committee_update_output_schema() -> str:
+    return (
+        "Return concise JSON only with keys: "
+        "agent, revised_stance, revised_confidence, strongest_opposing_argument, response_to_opposition, final_reasoning. "
+        "revised_stance must be one of HOLD, LONG, CLOSE."
+    )
+
+
+def _committee_strategy_mandate() -> str:
+    return (
+        "Shared trading mandate and mechanics:\n"
+        "- You are advising a long-only momentum reinforcement-learning trading agent on a daily bar.\n"
+        "- The raw RL action is the trained model's first-pass decision, not noise.\n"
+        "- Actions: 0=HOLD, 1=LONG, 2=CLOSE.\n"
+        "- If currently flat, HOLD means stay flat and LONG means open long exposure.\n"
+        "- If currently long, HOLD means continue holding the open long and CLOSE means exit the long.\n"
+        "- The strategy is swing-style momentum, not day trading and not long-term value investing.\n"
+        f"- It has a minimum hold period of {int(getattr(CFG, 'MIN_HOLD_DAYS', 0))} days, cooldown rules after some exits, "
+        f"a {float(getattr(CFG, 'STOP_LOSS_TRAIN', 0.15)) * 100.0:.0f}% stop loss, and no fixed take-profit cap.\n"
+        "- The objective is to beat buy-and-hold of the traded stock over the evaluation window.\n"
+        "- Your job is to judge whether your evidence supports trusting the raw RL action or overriding it."
+    )
+
+
+def _build_committee_base_payload(symbol: str, env, *, raw_action: int, valid_actions: list[int]) -> dict:
+    review_date = env.current_datetime.strftime("%Y-%m-%d") if env is not None else ""
+    return {
+        "symbol": str(symbol),
+        "as_of_date": review_date,
+        "raw_rl_action": {"id": int(raw_action), "name": action_name(raw_action)},
+        "valid_actions": [{"id": int(a), "name": action_name(a)} for a in valid_actions],
+        "constraint_override_allowed": bool(getattr(CFG, "OVERWATCH_ALLOW_CONSTRAINT_OVERRIDE", False)),
+        "position": int(getattr(env, "position", 0)) if env is not None else None,
+        "cooldown_remaining": int(getattr(env, "cooldown_remaining", 0)) if env is not None else None,
+        "decision_card": build_overwatch_decision_card(env, raw_action=int(raw_action), valid_actions=valid_actions) if env is not None else "",
+        "strategy_mandate": _committee_strategy_mandate(),
+    }
+
+
+NEWS_COMPANY_NAME_BY_SYMBOL = {
+    "ABBV": "AbbVie",
+    "AEM": "Agnico Eagle Mines",
+    "AMAT": "Applied Materials",
+    "AMD": "Advanced Micro Devices",
+    "AMGN": "Amgen",
+    "AMZN": "Amazon",
+    "AVGO": "Broadcom",
+    "AXP": "American Express",
+    "CAT": "Caterpillar",
+    "CME": "CME Group",
+    "COST": "Costco",
+    "CSCO": "Cisco",
+    "CVX": "Chevron",
+    "DUK": "Duke Energy",
+    "EXC": "Exelon",
+    "FDX": "FedEx",
+    "GOOGL": "Alphabet",
+    "GS": "Goldman Sachs",
+    "IBM": "International Business Machines",
+    "INTC": "Intel",
+    "INTU": "Intuit",
+    "JPM": "JPMorgan Chase",
+    "KO": "Coca-Cola",
+    "LIN": "Linde",
+    "LLY": "Eli Lilly",
+    "LRCX": "Lam Research",
+    "MCD": "McDonald's",
+    "MDT": "Medtronic",
+    "META": "Meta Platforms",
+    "MPC": "Marathon Petroleum",
+    "MRK": "Merck",
+    "MU": "Micron Technology",
+    "NFLX": "Netflix",
+    "NSC": "Norfolk Southern",
+    "NVDA": "NVIDIA",
+    "PANW": "Palo Alto Networks",
+    "PLTR": "Palantir",
+    "RKLB": "Rocket Lab",
+    "RTX": "RTX",
+    "SLB": "Schlumberger",
+    "TJX": "TJX Companies",
+}
+
+
+def _safe_find_news_context(symbol: str, as_of: str, *, focus: str) -> tuple[str, dict]:
+    if not bool(getattr(CFG, "OVERWATCH_COMMITTEE_NEWS_ENABLED", True)):
+        return "News retrieval disabled for this Overwatch committee call.", {"enabled": False}
+
+    try:
+        try:
+            from utils.news_retrieval_gate_prototype import find_news
+        except ModuleNotFoundError:
+            from unrealai.utils.news_retrieval_gate_prototype import find_news
+
+        if focus == "market":
+            query_symbol = "SPY"
+            company_name = "S&P 500 Nasdaq Federal Reserve Treasury yields market regime"
+        else:
+            query_symbol = str(symbol)
+            company_name = NEWS_COMPANY_NAME_BY_SYMBOL.get(str(symbol).strip().upper(), str(symbol))
+
+        retrieval_provider = str(getattr(CFG, "OVERWATCH_NEWS_RETRIEVAL_PROVIDER", "tavily")).strip().lower()
+        result = find_news(
+            as_of,
+            symbol=query_symbol,
+            company_name=company_name,
+            api_key=OPENAI_API_KEY if retrieval_provider in {"openai", "llm", "web_search"} else None,
+            model=str(getattr(CFG, "OVERWATCH_NEWS_RETRIEVAL_MODEL", "gpt-5-mini")),
+            reasoning_effort=str(getattr(CFG, "OVERWATCH_NEWS_RETRIEVAL_REASONING_EFFORT", "medium")),
+            provider=retrieval_provider,
+            max_candidates=int(getattr(CFG, "OVERWATCH_NEWS_MAX_CANDIDATES", 8)),
+            max_context_articles=int(getattr(CFG, "OVERWATCH_NEWS_MAX_CONTEXT_ARTICLES", 6)),
+            min_publication_lag_minutes=int(getattr(CFG, "OVERWATCH_NEWS_MIN_PUBLICATION_LAG_MINUTES", 0)),
+        )
+        audit = {
+            "enabled": True,
+            "focus": focus,
+            "query_symbol": query_symbol,
+            "retrieval_provider": retrieval_provider,
+            "retrieval_model": (
+                "tavily-search"
+                if retrieval_provider == "tavily"
+                else str(getattr(CFG, "OVERWATCH_NEWS_RETRIEVAL_MODEL", "gpt-5-mini"))
+            ),
+            "retrieval_reasoning_effort": (
+                "n/a"
+                if retrieval_provider == "tavily"
+                else str(getattr(CFG, "OVERWATCH_NEWS_RETRIEVAL_REASONING_EFFORT", "medium"))
+            ),
+            "accepted_count": len(result.accepted),
+            "rejected_count": len(result.rejected),
+        }
+        return result.overwatch_context, audit
+    except Exception as exc:
+        return (
+            f"News retrieval failed for {focus} focus. Treat this as no approved point-in-time news. Error: {exc}",
+            {"enabled": True, "focus": focus, "error": str(exc)},
+        )
+
+
+def _run_technical_agent(symbol: str, base_payload: dict, img_b64_str: str) -> str:
+    prompt = (
+        "You are the Technical Agent in an Overwatch trading committee. "
+        "Use only the chart image when provided and the decision payload. Do not use internet or outside facts. "
+        "Assess price action, anchored VWAPs, relative strength, trend quality, position state, and whether the raw RL action should be trusted. "
+        "Your job is not to make the final committee decision; make the strongest technical case and identify what could invalidate it.\n\n"
+        f"{_committee_strategy_mandate()}\n\n"
+        f"{_committee_agent_output_schema()}\n\n"
+        f"Decision payload:\n{_jsonish_payload(base_payload)}"
+    )
+    return _ollama_chat(
+        [{"role": "user", "content": prompt}],
+        model=str(getattr(CFG, "OVERWATCH_TECHNICAL_MODEL", OVERWATCH_MODEL)),
+        img_b64_str=img_b64_str,
+    )
+
+
+def _run_news_agent(agent_name: str, base_payload: dict, news_context: str, focus_instruction: str) -> str:
+    prompt = (
+        f"You are the {agent_name} in an Overwatch trading committee. "
+        f"{focus_instruction} "
+        "Use only the approved point-in-time news context and the decision payload. "
+        "Never infer or cite facts after the as-of date. If the news context is empty or failed, say so and lower confidence.\n\n"
+        f"{_committee_strategy_mandate()}\n\n"
+        f"{_committee_agent_output_schema()}\n\n"
+        f"Decision payload:\n{_jsonish_payload(base_payload)}\n\n"
+        f"Approved news context:\n{news_context}"
+    )
+    return _ollama_chat([{"role": "user", "content": prompt}])
+
+
+def _run_committee_update(agent_name: str, prior_output: str, base_payload: dict, other_outputs: dict, *, img_b64_str: str | None = None) -> str:
+    transcript = "\n\n".join([f"{name}:\n{text}" for name, text in other_outputs.items()])
+    prompt = (
+        f"You are the {agent_name} in the Overwatch committee debate. "
+        "Read the other agents' initial views, name the strongest opposing argument, and either maintain or revise your stance. "
+        "Do not introduce new outside facts. Stay inside the as-of date.\n\n"
+        f"{_committee_strategy_mandate()}\n\n"
+        f"{_committee_update_output_schema()}\n\n"
+        f"Decision payload:\n{_jsonish_payload(base_payload)}\n\n"
+        f"Your initial output:\n{prior_output}\n\n"
+        f"Other agents' initial outputs:\n{transcript}"
+    )
+    if agent_name.lower().startswith("technical"):
+        return _ollama_chat(
+            [{"role": "user", "content": prompt}],
+            model=str(getattr(CFG, "OVERWATCH_TECHNICAL_MODEL", OVERWATCH_MODEL)),
+            img_b64_str=img_b64_str,
+        )
+    return _ollama_chat([{"role": "user", "content": prompt}])
+
+
+def _run_committee_chair(base_payload: dict, initial_outputs: dict, updated_outputs: dict, *, img_b64_str: str | None = None) -> str:
+    valid_ids = [int(item["id"]) for item in base_payload.get("valid_actions", [])]
+    transcript = {
+        "initial_outputs": initial_outputs,
+        "updated_outputs": updated_outputs,
+    }
+    prompt = (
+        "You are the Committee Chair and final Overwatch decision maker. "
+        "You supervise a long-only momentum RL trading agent. "
+        "The Technical Agent used the chart. The Company News Agent and Market News Agent used only Python-gated point-in-time news. "
+        "Resolve disagreements, respect the as-of date, and decide the final trading action. "
+        "You may choose an action outside valid_actions only when the payload indicates Overwatch constraint override is allowed by the training system; otherwise prefer valid_actions. "
+        "Reply ONLY with: <number choice> - <two-sentence reason>. "
+        f"The number must be one of 0 HOLD, 1 LONG, 2 CLOSE. Current valid action ids: {valid_ids}.\n\n"
+        f"{_committee_strategy_mandate()}\n\n"
+        f"Decision payload:\n{_jsonish_payload(base_payload)}\n\n"
+        f"Committee transcript:\n{_jsonish_payload(transcript)}"
+    )
+    return _ollama_chat(
+        [{"role": "user", "content": prompt}],
+        model=str(getattr(CFG, "OVERWATCH_CHAIR_MODEL", OVERWATCH_MODEL)),
+        img_b64_str=img_b64_str if bool(getattr(CFG, "OVERWATCH_CHAIR_SEES_CHART_IMAGE", False)) else None,
+    )
+
+
+def overwatch_committee_decision(raw_action: int, img_b64_str: str, *, symbol: str, env, valid_actions: list[int]) -> tuple[str, dict]:
+    base_payload = _build_committee_base_payload(symbol, env, raw_action=int(raw_action), valid_actions=valid_actions)
+    as_of = str(base_payload.get("as_of_date", ""))
+    step = int(getattr(env, "current_step", 0)) if env is not None else None
+    _overwatch_progress(symbol, as_of, step, "committee starting; agents received chart and decision payload")
+
+    _overwatch_progress(symbol, as_of, step, "retrieving company and market news context")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        company_future = executor.submit(_safe_find_news_context, symbol, as_of, focus="company")
+        market_future = executor.submit(_safe_find_news_context, symbol, as_of, focus="market")
+        company_news_context, company_news_audit = company_future.result()
+        market_news_context, market_news_audit = market_future.result()
+    _overwatch_progress(
+        symbol,
+        as_of,
+        step,
+        "news context ready "
+        f"(company accepted={company_news_audit.get('accepted_count', 'NA')}, "
+        f"market accepted={market_news_audit.get('accepted_count', 'NA')})",
+    )
+
+    _overwatch_progress(symbol, as_of, step, "technical agent starting")
+    technical_output = _run_technical_agent(symbol, base_payload, img_b64_str)
+    _overwatch_progress(symbol, as_of, step, "technical agent done")
+
+    _overwatch_progress(symbol, as_of, step, "company news agent starting")
+    company_news_output = _run_news_agent(
+        "Company News Agent",
+        base_payload,
+        company_news_context,
+        "Focus on company-specific catalysts such as earnings, guidance, product, management, regulation, litigation, analyst actions, and financing.",
+    )
+    _overwatch_progress(symbol, as_of, step, "company news agent done")
+
+    _overwatch_progress(symbol, as_of, step, "market news agent starting")
+    market_news_output = _run_news_agent(
+        "Market News Agent",
+        base_payload,
+        market_news_context,
+        "Focus on broad market, sector, rates, Fed, inflation, liquidity, risk appetite, and index conditions.",
+    )
+    _overwatch_progress(symbol, as_of, step, "market news agent done")
+
+    initial_outputs = {
+        "technical": technical_output,
+        "company_news": company_news_output,
+        "market_news": market_news_output,
+    }
+
+    updated_outputs = dict(initial_outputs)
+    debate_rounds = max(0, int(getattr(CFG, "OVERWATCH_COMMITTEE_DEBATE_ROUNDS", 1)))
+    for round_idx in range(debate_rounds):
+        _overwatch_progress(symbol, as_of, step, f"debate round {round_idx + 1}/{debate_rounds} starting")
+        updated_outputs = {
+            "technical": _run_committee_update(
+                "Technical Agent",
+                updated_outputs["technical"],
+                base_payload,
+                {
+                    "company_news": updated_outputs["company_news"],
+                    "market_news": updated_outputs["market_news"],
+                },
+                img_b64_str=img_b64_str,
+            ),
+            "company_news": _run_committee_update(
+                "Company News Agent",
+                updated_outputs["company_news"],
+                base_payload,
+                {
+                    "technical": updated_outputs["technical"],
+                    "market_news": updated_outputs["market_news"],
+                },
+            ),
+            "market_news": _run_committee_update(
+                "Market News Agent",
+                updated_outputs["market_news"],
+                base_payload,
+                {
+                    "technical": updated_outputs["technical"],
+                    "company_news": updated_outputs["company_news"],
+                },
+            ),
+        }
+        _overwatch_progress(symbol, as_of, step, f"debate round {round_idx + 1}/{debate_rounds} done")
+
+    _overwatch_progress(symbol, as_of, step, "committee chair starting final decision")
+    final_reply = _run_committee_chair(base_payload, initial_outputs, updated_outputs, img_b64_str=img_b64_str)
+    _overwatch_progress(symbol, as_of, step, f"committee chair done; final reply: {final_reply[:180]}")
+    audit = {
+        "committee_enabled": True,
+        "models": {
+            "technical": str(getattr(CFG, "OVERWATCH_TECHNICAL_MODEL", OVERWATCH_MODEL)),
+            "company_news": str(getattr(CFG, "OVERWATCH_LOCAL_AGENT_MODEL", "gemma4:26b")),
+            "market_news": str(getattr(CFG, "OVERWATCH_LOCAL_AGENT_MODEL", "gemma4:26b")),
+            "chair": str(getattr(CFG, "OVERWATCH_CHAIR_MODEL", OVERWATCH_MODEL)),
+        },
+        "news": {
+            "company": company_news_audit,
+            "market": market_news_audit,
+        },
+        "base_payload": base_payload,
+        "initial_outputs": initial_outputs,
+        "updated_outputs": updated_outputs,
+        "final_reply": final_reply,
+    }
+    return final_reply, audit
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -711,29 +1104,9 @@ def write_batch_progress_files(output_dir: str, completed_symbols: list[str], fi
     with open(root / "batch_progress.json", "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
-    with open(root / "completed_symbols_for_config.txt", "w", encoding="utf-8") as f:
-        f.write("COMPLETED_SYMBOLS = [\n")
+    with open(root / "completed_symbols_this_run.txt", "w", encoding="utf-8") as f:
         for symbol in completed_symbols:
-            f.write(f'    "{symbol}",\n')
-        f.write("]\n")
-
-
-def save_overwatch_chart(fig, *, symbol: str, review_date: str, step: int, raw_action: int, source_tag: str) -> str | None:
-    if not bool(getattr(CFG, "SAVE_OVERWATCH_CHARTS", False)):
-        return None
-
-    root = Path(getattr(CFG, "OVERWATCH_CHARTS_DIR", "")).expanduser()
-    if not str(root):
-        return None
-
-    symbol_dir = root / str(symbol)
-    symbol_dir.mkdir(parents=True, exist_ok=True)
-
-    stamp = pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
-    filename = f"{review_date}_step{int(step):05d}_raw{int(raw_action)}_{source_tag}_{stamp}.png"
-    output_path = symbol_dir / filename
-    fig.savefig(output_path, format="png", bbox_inches="tight")
-    return str(output_path)
+            f.write(f"{symbol}\n")
 
 
 def action_name(action: int) -> str:
@@ -834,28 +1207,6 @@ def resolve_constraint_override(env, model_action: int) -> tuple[bool, str]:
         return True, "min_hold"
 
     return False, ""
-
-
-def reset_overwatch_chart_storage(log_queue=None) -> None:
-    overwatch_active = bool(getattr(CFG, "OVERWATCH_ENABLED_TRAIN", False)) or bool(getattr(CFG, "OVERWATCH_ENABLED_TEST", False))
-    if not overwatch_active:
-        return
-    if not bool(getattr(CFG, "SAVE_OVERWATCH_CHARTS", False)):
-        return
-
-    root = Path(getattr(CFG, "OVERWATCH_CHARTS_DIR", "")).expanduser()
-    if not str(root):
-        return
-
-    if root.exists():
-        shutil.rmtree(root, ignore_errors=True)
-    root.mkdir(parents=True, exist_ok=True)
-
-    msg = f"Reset overwatch chart storage: {root}"
-    if log_queue is not None:
-        child_log(log_queue, msg)
-    else:
-        print(msg, flush=True)
 
 
 def get_ram_usage():
@@ -1720,34 +2071,43 @@ class DQNAgent:
             if raw_action not in valid_actions:
                 raw_action = int(valid_actions[0])
 
-        every_n = max(1, int(CFG.OVERWATCH_EVERY_N_STEPS))
-        if allow_overwatch and (self.overwatch_counter % every_n == 0):
-            chart_module = get_chart_module()
-            fig = chart_module.build_fig(symbol, end=env.current_datetime.strftime("%Y-%m-%d"))
-
-            fig.text(
-                0.01, 0.99, build_overwatch_decision_card(env, raw_action=int(raw_action), valid_actions=valid_actions),
-                va="top", ha="left",
-                color="white", fontsize=8,
-                bbox=dict(facecolor="black", alpha=0.6)
-            )
-
-            chart_path = save_overwatch_chart(
-                fig,
-                symbol=symbol,
-                review_date=env.current_datetime.strftime("%Y-%m-%d"),
-                step=int(env.current_step),
-                raw_action=int(raw_action),
-                source_tag="overwatch",
-            )
-            img_bytes = fig_to_bytes(fig)
-            plt.close(fig)
-
-            img_b64_str = base64.b64encode(img_bytes).decode("utf-8")
-
+        overwatch_action_trigger = int(raw_action) in {ACTION_LONG, ACTION_CLOSE}
+        if allow_overwatch and overwatch_action_trigger:
+            committee_audit = {}
             try:
-                resp_txt = overwatch_decision(raw_action, img_b64_str)
+                chart_module = get_chart_module()
+                fig = chart_module.build_fig(symbol, end=env.current_datetime.strftime("%Y-%m-%d"))
+                if fig is None:
+                    raise RuntimeError("Overwatch chart builder returned None")
+
+                fig.text(
+                    0.01, 0.99, build_overwatch_decision_card(env, raw_action=int(raw_action), valid_actions=valid_actions),
+                    va="top", ha="left",
+                    color="white", fontsize=8,
+                    bbox=dict(facecolor="black", alpha=0.6)
+                )
+
+                img_bytes = fig_to_bytes(fig)
+                plt.close(fig)
+
+                img_b64_str = base64.b64encode(img_bytes).decode("utf-8")
+                if bool(getattr(CFG, "OVERWATCH_COMMITTEE_ENABLED", False)):
+                    _overwatch_progress(
+                        symbol,
+                        env.current_datetime.strftime("%Y-%m-%d"),
+                        int(env.current_step),
+                        f"chart ready; raw={action_name(raw_action)} valid={'/'.join(action_name(a) for a in valid_actions)}",
+                    )
             except Exception as e:
+                try:
+                    plt.close("all")
+                except Exception:
+                    pass
+                print(
+                    f"[OVERWATCH] {symbol} {env.current_datetime.strftime('%Y-%m-%d')} "
+                    f"step={int(env.current_step)} chart setup failed: {e}",
+                    flush=True,
+                )
                 self.overwatch_logs.append({
                     "symbol": symbol,
                     "step": int(env.current_step),
@@ -1763,7 +2123,46 @@ class DQNAgent:
                     "model_action_invalid": False,
                     "constraint_override": False,
                     "constraint_override_reason": "",
-                    "chart_path": chart_path if 'chart_path' in locals() and chart_path else "",
+                    "committee_enabled": bool(getattr(CFG, "OVERWATCH_COMMITTEE_ENABLED", False)),
+                    "committee_audit": _truncate_text(_jsonish_payload(committee_audit), int(getattr(CFG, "OVERWATCH_COMMITTEE_MAX_AUDIT_CHARS", 12000))),
+                    "error": f"chart_setup_failed: {e}",
+                })
+                return raw_action
+
+            try:
+                if bool(getattr(CFG, "OVERWATCH_COMMITTEE_ENABLED", False)):
+                    resp_txt, committee_audit = overwatch_committee_decision(
+                        raw_action,
+                        img_b64_str,
+                        symbol=symbol,
+                        env=env,
+                        valid_actions=valid_actions,
+                    )
+                else:
+                    resp_txt = overwatch_decision(raw_action, img_b64_str)
+            except Exception as e:
+                print(
+                    f"[OVERWATCH] {symbol} {env.current_datetime.strftime('%Y-%m-%d')} "
+                    f"step={int(env.current_step)} decision failed: {e}",
+                    flush=True,
+                )
+                self.overwatch_logs.append({
+                    "symbol": symbol,
+                    "step": int(env.current_step),
+                    "date": env.current_datetime.strftime("%Y-%m-%d"),
+                    "position": int(env.position),
+                    "cooldown_remaining": int(getattr(env, "cooldown_remaining", 0)),
+                    "valid_actions": ",".join(map(str, valid_actions)),
+                    "raw_action": int(raw_action),
+                    "final_action": int(raw_action),
+                    "overrode": False,
+                    "model_action": None,
+                    "model_reply": "",
+                    "model_action_invalid": False,
+                    "constraint_override": False,
+                    "constraint_override_reason": "",
+                    "committee_enabled": bool(getattr(CFG, "OVERWATCH_COMMITTEE_ENABLED", False)),
+                    "committee_audit": _truncate_text(_jsonish_payload(committee_audit), int(getattr(CFG, "OVERWATCH_COMMITTEE_MAX_AUDIT_CHARS", 12000))),
                     "error": str(e),
                 })
                 return raw_action
@@ -1805,7 +2204,8 @@ class DQNAgent:
                 "model_action_invalid": bool(model_action_invalid),
                 "constraint_override": bool(constraint_override),
                 "constraint_override_reason": constraint_override_reason,
-                "chart_path": chart_path or "",
+                "committee_enabled": bool(getattr(CFG, "OVERWATCH_COMMITTEE_ENABLED", False)),
+                "committee_audit": _truncate_text(_jsonish_payload(committee_audit), int(getattr(CFG, "OVERWATCH_COMMITTEE_MAX_AUDIT_CHARS", 12000))),
                 "error": "",
             })
             return final_action
@@ -2215,7 +2615,7 @@ def train_agent_on_df(agent, df, *, episodes=10, window_size=20,
         )
 
     train_every = max(1, int(CFG.TRAIN_REPLAY_EVERY_N_STEPS))
-    agent.overwatch_enabled = False
+    agent.overwatch_enabled = bool(CFG.OVERWATCH_ENABLED_TRAIN)
 
     child_log(log_queue, f"[{symbol}] Replay reset policy: {describe_memory_reset_policy()}")
     child_log(
@@ -2255,7 +2655,12 @@ def train_agent_on_df(agent, df, *, episodes=10, window_size=20,
         in_market_steps = 0
 
         while True:
-            action = agent.act(state, env=env, symbol=symbol, use_overwatch=False)
+            action = agent.act(
+                state,
+                env=env,
+                symbol=symbol,
+                use_overwatch=bool(CFG.OVERWATCH_ENABLED_TRAIN),
+            )
             next_state, reward, done, _ = env.step(action)
 
             agent.remember(state, action, reward, next_state, done)
@@ -3169,7 +3574,6 @@ if __name__ == "__main__":
         mgr = multiprocessing.Manager()
         log_q = mgr.Queue()
         threading.Thread(target=logging_listener, args=(log_q,), daemon=True).start()
-    reset_overwatch_chart_storage(log_q)
 
     print(f"Replay buffer reset policy: {describe_memory_reset_policy()}")
     print(f"Minimum hold days: {CFG.MIN_HOLD_DAYS}")
@@ -3177,43 +3581,32 @@ if __name__ == "__main__":
     print(f"Resume from checkpoint: {CFG.RESUME_FROM_CHECKPOINT}")
     print(f"Reuse saved scaler: {CFG.REUSE_SAVED_SCALER}")
 
-    completed_symbols = normalize_symbol_list(getattr(CFG, "COMPLETED_SYMBOLS", []))
-    batch_limit = max(0, int(getattr(CFG, "BATCH_SYMBOL_LIMIT", 0)))
+    output_dir = str(CFG.OUTPUT_DIR)
+    window_size = int(CFG.WINDOW_SIZE)
+    episodes = int(CFG.EPISODES)
+    initial_cash = float(CFG.INITIAL_CASH)
+
+    completed_symbols = []
+    symbols_per_wave = max(1, int(CFG.NUMBER_OF_POOLS))
 
     all_pairs = [
         (symbol_from_csv_path(tr), tr, te)
         for tr, te in zip(CFG.TRAIN_FILES, CFG.TEST_FILES)
     ]
     remaining_pairs = [(sym, tr, te) for sym, tr, te in all_pairs if sym not in set(completed_symbols)]
-    if batch_limit > 0:
-        selected_pairs = remaining_pairs[:batch_limit]
-    else:
-        selected_pairs = remaining_pairs
 
-    train_files = [tr for _, tr, _ in selected_pairs]
-    test_files = [te for _, _, te in selected_pairs]
-    batch_symbols = [sym for sym, _, _ in selected_pairs]
-
-    print(f"Workers: {min(len(train_files), CFG.NUMBER_OF_POOLS)}")
     print(f"Use multiprocessing: {CFG.USE_MULTIPROCESSING}")
-    print(f"Already completed: {len(completed_symbols)}")
-    print(f"Remaining symbols: {len(remaining_pairs)}")
-    print(f"Batch limit: {batch_limit if batch_limit > 0 else 'ALL'}")
-    print(f"Current batch symbols ({len(batch_symbols)}): {batch_symbols}")
+    print(f"Total symbols: {len(all_pairs)}")
+    print(f"Symbols to run: {len(remaining_pairs)}")
+    print(f"Symbols per wave: {symbols_per_wave}")
 
-    if not train_files:
-        print("No symbols left to run for this batch.")
+    if not remaining_pairs:
+        print("No symbols left to run.")
         if log_q is not None:
             log_q.put("END")
-        gc.collect()
         raise SystemExit(0)
 
-    output_dir = str(CFG.OUTPUT_DIR)
-    window_size = int(CFG.WINDOW_SIZE)
-    episodes = int(CFG.EPISODES)
-    initial_cash = float(CFG.INITIAL_CASH)
-
-    dummy_df = load_csv(train_files[0], require_eval_prices=False)
+    dummy_df = load_csv(remaining_pairs[0][1], require_eval_prices=False)
     tmp_env = TradingEnv(dummy_df, window_size=window_size, min_hold_days=int(CFG.MIN_HOLD_DAYS))
     state_size = tmp_env.observation_space.shape
     action_size = tmp_env.action_space.n
@@ -3231,32 +3624,54 @@ if __name__ == "__main__":
     }
 
     start_time = time.time()
-    finished_batch = main_loop(
-        agent_parameters,
-        train_files,
-        test_files,
-        output_dir,
-        window_size=window_size,
-        episodes=episodes,
-        initial_cash=initial_cash,
-        log_queue=log_q,
-        precompleted_symbols=completed_symbols,
-    )
-    finished_batch = normalize_symbol_list(finished_batch)
-    updated_completed = normalize_symbol_list(completed_symbols + finished_batch)
-    write_batch_progress_files(output_dir, updated_completed, finished_batch)
+    finished_this_run = []
+    batch_index = 0
 
-    print(f"Finished batch symbols ({len(finished_batch)}): {finished_batch}")
-    print("\nPaste this into CFG.COMPLETED_SYMBOLS for the next restart:")
-    print("COMPLETED_SYMBOLS = [")
-    for symbol in updated_completed:
-        print(f'    "{symbol}",')
-    print("]")
+    while True:
+        completed_set = set(completed_symbols)
+        remaining_pairs = [(sym, tr, te) for sym, tr, te in all_pairs if sym not in completed_set]
+        if not remaining_pairs:
+            print("All symbols completed.")
+            break
+
+        batch_index += 1
+        selected_pairs = remaining_pairs[:symbols_per_wave]
+
+        train_files = [tr for _, tr, _ in selected_pairs]
+        test_files = [te for _, _, te in selected_pairs]
+        batch_symbols = [sym for sym, _, _ in selected_pairs]
+
+        print(f"\n=== Batch {batch_index} ===")
+        print(f"Workers: {min(len(train_files), CFG.NUMBER_OF_POOLS)}")
+        print(f"Completed before batch: {len(completed_symbols)}")
+        print(f"Remaining before batch: {len(remaining_pairs)}")
+        print(f"Current batch symbols ({len(batch_symbols)}): {batch_symbols}")
+
+        finished_batch = main_loop(
+            agent_parameters,
+            train_files,
+            test_files,
+            output_dir,
+            window_size=window_size,
+            episodes=episodes,
+            initial_cash=initial_cash,
+            log_queue=log_q,
+            precompleted_symbols=completed_symbols,
+        )
+        finished_batch = normalize_symbol_list(finished_batch)
+        if not finished_batch:
+            print("No symbols finished in this batch; stopping to avoid an infinite loop.")
+            break
+
+        finished_this_run = normalize_symbol_list(finished_this_run + finished_batch)
+        completed_symbols = normalize_symbol_list(completed_symbols + finished_batch)
+        write_batch_progress_files(output_dir, completed_symbols, finished_batch)
 
     elapsed = time.time() - start_time
     h, rem = divmod(elapsed, 3600)
     m, _ = divmod(rem, 60)
     print(f"Total runtime: {int(h)}h {int(m)}m")
+    print(f"Finished this run ({len(finished_this_run)}): {finished_this_run}")
 
     if log_q is not None:
         log_q.put("END")
