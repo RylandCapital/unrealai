@@ -145,7 +145,7 @@ class CFG:
 
     # Spark-friendly default: one trainer process feeding one GPU.
     USE_MULTIPROCESSING = True
-    NUMBER_OF_POOLS = 4
+    NUMBER_OF_POOLS = env_int("NUMBER_OF_POOLS", 1)
     TASKS_PER_CHILD = 1
     SEED = 42
 
@@ -173,8 +173,7 @@ class CFG:
     MOMENTUM_PREMATURE_CLOSE_PENALTY = 0.00050
 
     OVERWATCH_ENABLED_TRAIN = env_bool("OVERWATCH_ENABLED_TRAIN", False)
-    OVERWATCH_ENABLED_TEST = env_bool("OVERWATCH_ENABLED_TEST", True)
-    OVERWATCH_EVERY_N_STEPS = 10
+    OVERWATCH_ENABLED_TEST = env_bool("OVERWATCH_ENABLED_TEST", False)
     OVERWATCH_ALLOW_CONSTRAINT_OVERRIDE = True
     OVERWATCH_COMMITTEE_ENABLED = env_bool("OVERWATCH_COMMITTEE_ENABLED", True)
     OVERWATCH_COMMITTEE_NEWS_ENABLED = env_bool("OVERWATCH_COMMITTEE_NEWS_ENABLED", True)
@@ -225,7 +224,7 @@ class CFG:
     TRAIN_REPLAY_EVERY_N_STEPS = 34
     BATCHSIZE = 55
     WINDOW_SIZE = 21
-    EPISODES = 30
+    EPISODES = 100
     GREEDY_EVAL_EVERY = 10
 
     REWARD_ROLLING_MEDIAN_WINDOW = 10
@@ -252,21 +251,15 @@ class CFG:
 
     TRAIN_DIR = APP_DIR / "traindata"
     TEST_DIR  = APP_DIR / "testdata"
-
-    train_map = {p.stem.upper(): p for p in TRAIN_DIR.glob("*.csv")}
-    test_map  = {p.stem.upper(): p for p in TEST_DIR.glob("*.csv")}
-
-    common_symbols = sorted(set(train_map) & set(test_map))
-
-    if not common_symbols:
-        raise FileNotFoundError("No matching CSV symbols found in both traindata and testdata.")
-
     TRAIN_FILES = []
     TEST_FILES = []
 
-    for sym in common_symbols:
-        TRAIN_FILES.append(str(train_map[sym]))
-        TEST_FILES.append(str(test_map[sym]))
+    AGGREGATE_BENCHMARK_SYMBOLS = [
+        s.strip().upper()
+        for s in os.getenv("AGGREGATE_BENCHMARK_SYMBOLS", "EQAL,RSP,QQQE").split(",")
+        if s.strip()
+    ]
+    EXCLUDE_AGGREGATE_BENCHMARKS_FROM_TRAINING = env_bool("EXCLUDE_AGGREGATE_BENCHMARKS_FROM_TRAINING", True)
 
     
     INITIAL_CASH = 100_000_000
@@ -1087,6 +1080,26 @@ def symbol_from_csv_path(path: str) -> str:
     return Path(path).stem.upper()
 
 
+def discover_symbol_file_pairs(train_dir, test_dir) -> tuple[list[str], list[str]]:
+    train_dir = Path(train_dir)
+    test_dir = Path(test_dir)
+
+    train_map = {p.stem.upper(): p for p in train_dir.glob("*.csv")}
+    test_map = {p.stem.upper(): p for p in test_dir.glob("*.csv")}
+
+    common_symbols = sorted(set(train_map) & set(test_map))
+    if bool(getattr(CFG, "EXCLUDE_AGGREGATE_BENCHMARKS_FROM_TRAINING", True)):
+        benchmark_symbols = set(normalize_symbol_list(getattr(CFG, "AGGREGATE_BENCHMARK_SYMBOLS", [])))
+        common_symbols = [sym for sym in common_symbols if sym not in benchmark_symbols]
+
+    if not common_symbols:
+        raise FileNotFoundError(f"No matching CSV symbols found in both {train_dir} and {test_dir}.")
+
+    train_files = [str(train_map[sym]) for sym in common_symbols]
+    test_files = [str(test_map[sym]) for sym in common_symbols]
+    return train_files, test_files
+
+
 def write_batch_progress_files(output_dir: str, completed_symbols: list[str], finished_symbols: list[str]) -> None:
     if not bool(getattr(CFG, "WRITE_BATCH_PROGRESS_FILES", True)):
         return
@@ -1107,6 +1120,21 @@ def write_batch_progress_files(output_dir: str, completed_symbols: list[str], fi
     with open(root / "completed_symbols_this_run.txt", "w", encoding="utf-8") as f:
         for symbol in completed_symbols:
             f.write(f"{symbol}\n")
+
+
+def read_completed_symbols_from_progress(output_dir: str) -> list[str]:
+    progress_path = Path(output_dir) / "batch_progress.json"
+    if not progress_path.exists():
+        return []
+
+    try:
+        with open(progress_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as exc:
+        print(f"Warning: failed reading batch progress file {progress_path}: {exc}", flush=True)
+        return []
+
+    return normalize_symbol_list(payload.get("completed_symbols", []))
 
 
 def action_name(action: int) -> str:
@@ -1661,6 +1689,8 @@ class TradingEnv(gym.Env):
         self.overwatch_force_close_once = False
         pre_position = int(self.position)
         close_reason = ""
+        opened_trade = False
+        closed_trade = False
 
         prev_equity = float(self.equity)
         prev_bh_equity = float(self.bh_equity)
@@ -1671,6 +1701,8 @@ class TradingEnv(gym.Env):
 
             if self.position != 0:
                 self._do_close(price)
+                closed_trade = True
+                close_reason = "terminal"
 
             self._mark_to_market(price)
             self._update_benchmark(price)
@@ -1681,7 +1713,14 @@ class TradingEnv(gym.Env):
             self.prev_equity = float(self.equity)
             self.prev_bh_equity = float(self.bh_equity)
 
-            info = {"bankrupt": True} if blew_up else {}
+            info = {
+                "bankrupt": bool(blew_up),
+                "opened_trade": False,
+                "closed_trade": bool(closed_trade),
+                "close_reason": close_reason,
+                "force_open": bool(force_open),
+                "force_close": bool(force_close),
+            }
             return self._get_obs(), float(reward), True, info
 
         price = float(self.prices[self.current_step])
@@ -1691,6 +1730,7 @@ class TradingEnv(gym.Env):
             self.close_hits += 1
             close_pct = self._do_close(price)
             close_reason = "discretionary"
+            closed_trade = True
             self.cooldown_remaining = self._cooldown_days_after_exit(close_pct, close_reason)
 
         if self.position != 0:
@@ -1698,9 +1738,9 @@ class TradingEnv(gym.Env):
             if pct_move <= -self.stop_loss or pct_move >= self.take_profit:
                 close_reason = "stop_loss" if pct_move <= -self.stop_loss else "take_profit"
                 close_pct = self._do_close(price)
+                closed_trade = True
                 self.cooldown_remaining = self._cooldown_days_after_exit(close_pct, close_reason)
 
-        opened_trade = False
         if self.position == 0 and (self.cooldown_remaining == 0 or force_open):
             if action == ACTION_LONG:
                 opened_trade = True
@@ -1744,7 +1784,14 @@ class TradingEnv(gym.Env):
         self.prev_equity = float(self.equity)
         self.prev_bh_equity = float(self.bh_equity)
 
-        info = {"bankrupt": True} if blew_up else {}
+        info = {
+            "bankrupt": bool(blew_up),
+            "opened_trade": bool(opened_trade),
+            "closed_trade": bool(closed_trade),
+            "close_reason": close_reason,
+            "force_open": bool(force_open),
+            "force_close": bool(force_close),
+        }
         if blew_up:
             self.done = True
 
@@ -2484,7 +2531,8 @@ def plot_symbol_test_results(symbol, result, save_path):
     fig.write_html(save_path)
 
 
-def plot_aggregated_results_multi(curves_dict, invested_dict, stats_by_mode, dates, save_path=None):
+def plot_aggregated_results_multi(curves_dict, invested_dict, stats_by_mode, dates, save_path=None, benchmark_curves=None):
+    benchmark_curves = benchmark_curves or {}
     fig = make_subplots(
         rows=2,
         cols=1,
@@ -2494,9 +2542,20 @@ def plot_aggregated_results_multi(curves_dict, invested_dict, stats_by_mode, dat
     )
 
     fig.add_trace(
-        go.Scatter(x=dates, y=curves_dict["buy_hold"], mode="lines", name="Buy & Hold"),
+        go.Scatter(x=dates, y=curves_dict["buy_hold"], mode="lines", name="Selected Basket B&H"),
         row=1, col=1
     )
+
+    for symbol, curve in benchmark_curves.items():
+        fig.add_trace(
+            go.Scatter(
+                x=dates,
+                y=curve,
+                mode="lines",
+                name=f"{symbol} Benchmark"
+            ),
+            row=1, col=1
+        )
 
     for mode in CFG.ALL_FILL_MODES:
         label = get_fill_mode_display_name(mode)
@@ -2523,7 +2582,7 @@ def plot_aggregated_results_multi(curves_dict, invested_dict, stats_by_mode, dat
         )
 
     fig.update_layout(
-        title="Aggregated Performance: Buy & Hold vs Execution Assumptions",
+        title="Aggregated Performance: Strategy vs Selected Basket and Equal-Weight ETF Benchmarks",
         hovermode="x unified"
     )
 
@@ -2773,20 +2832,38 @@ def generate_test_signal_log(agent, df, *, window_size=20, initial_cash=100_000,
     signal_rows = []
 
     while True:
+        position_before = int(env.position)
+        cooldown_before = int(getattr(env, "cooldown_remaining", 0))
+
         if CFG.OVERWATCH_ENABLED_TEST:
             action = agent.act(state, env=env, symbol=symbol, use_overwatch=True)
         else:
             action = agent.act_greedy(state, env=env)
 
-        next_state, _, done, _ = env.step(action)
+        force_open = bool(getattr(env, "overwatch_force_open_once", False))
+        force_close = bool(getattr(env, "overwatch_force_close_once", False))
+        next_state, _, done, info = env.step(action)
 
         idx = int(env.last_price_idx) if env.last_price_idx is not None else int(max(0, env.current_step - 1))
         dt = pd.Timestamp(env.dates[idx])
+        closed_trade = bool(info.get("closed_trade", False))
+        close_reason = str(info.get("close_reason", "") or "")
+        replay_action = ACTION_CLOSE if closed_trade else int(action)
 
         signal_rows.append({
             "step": idx,
             "date": dt,
             "action": int(action),
+            "replay_action": int(replay_action),
+            "position_before": int(position_before),
+            "position_after": int(env.position),
+            "cooldown_before": int(cooldown_before),
+            "cooldown_after": int(getattr(env, "cooldown_remaining", 0)),
+            "opened_trade": bool(info.get("opened_trade", False)),
+            "closed_trade": bool(closed_trade),
+            "close_reason": close_reason,
+            "force_open": bool(force_open or info.get("force_open", False)),
+            "force_close": bool(force_close or info.get("force_close", False)),
         })
 
         state = next_state
@@ -2835,6 +2912,8 @@ def replay_signals_with_fill_mode(df, signal_rows, fill_mode: str, *,
                                   slippage_rate: float,
                                   cooldown_days: int,
                                   min_hold_days: int,
+                                  stop_loss: float | None = None,
+                                  take_profit: float | None = None,
                                   profitable_close_cooldown_days: int | None = None,
                                   losing_close_cooldown_days: int | None = None):
     if not signal_rows:
@@ -2851,7 +2930,7 @@ def replay_signals_with_fill_mode(df, signal_rows, fill_mode: str, *,
     first_step = int(signal_rows[0]["step"])
     last_step = int(signal_rows[-1]["step"])
 
-    action_by_step = {int(r["step"]): int(r["action"]) for r in signal_rows}
+    signal_by_step = {int(r["step"]): dict(r) for r in signal_rows}
 
     closes = df["adjusted_close"].to_numpy(dtype=np.float64)
     dates_all = pd.to_datetime(df["Date"]).tolist()
@@ -2873,17 +2952,19 @@ def replay_signals_with_fill_mode(df, signal_rows, fill_mode: str, *,
     out_equity = []
     out_invested = []
 
-    def _can_open():
-        return position == 0 and cooldown_remaining == 0
+    def _can_open(force: bool = False):
+        return position == 0 and (cooldown_remaining == 0 or bool(force))
 
     def _bars_held(asof_idx: int) -> int:
         if position != 1 or entry_step is None:
             return 0
         return max(0, int(asof_idx) - int(entry_step))
 
-    def _can_close(asof_idx: int):
+    def _can_close(asof_idx: int, force: bool = False):
         if position != 1:
             return False
+        if bool(force):
+            return True
         if int(min_hold_days) <= 0:
             return True
         return _bars_held(asof_idx) >= int(min_hold_days)
@@ -2935,18 +3016,28 @@ def replay_signals_with_fill_mode(df, signal_rows, fill_mode: str, *,
         signal_close = float(closes[signal_idx])
         return float(fill_px) < signal_close
 
+    def _stop_or_take_reason(idx: int) -> str:
+        if position != 1 or entry_price <= 0:
+            return ""
+        pct_move = (float(closes[idx]) - float(entry_price)) / (float(entry_price) + 1e-12)
+        if stop_loss is not None and pct_move <= -float(stop_loss):
+            return "stop_loss"
+        if take_profit is not None and pct_move >= float(take_profit):
+            return "take_profit"
+        return ""
+
     for idx in range(first_step, last_step + 1):
         if pending_order is not None and int(pending_order["fill_idx"]) == idx:
             fill_px = get_fill_price(df, idx, fill_mode)
             if pending_order["type"] == "open_long":
                 signal_idx = int(pending_order.get("signal_idx", idx - 1))
-                if _can_open():
+                if _can_open(force=bool(pending_order.get("force", False))):
                     if _entry_filter_passes(signal_idx, idx, fill_px):
                         _open_long(idx, fill_px)
                     else:
                         skipped_entry_filter_count += 1
             elif pending_order["type"] == "close_long":
-                if _can_close(idx):
+                if _can_close(idx, force=bool(pending_order.get("force", False))):
                     _close_long(idx, fill_px)
             pending_order = None
 
@@ -2961,24 +3052,43 @@ def replay_signals_with_fill_mode(df, signal_rows, fill_mode: str, *,
         out_equity.append(float(equity))
         out_invested.append(float(initial_cash if position == 1 else 0.0))
 
-        action = int(action_by_step.get(idx, ACTION_HOLD))
+        signal = signal_by_step.get(idx, {})
+        action = int(signal.get("replay_action", signal.get("action", ACTION_HOLD)))
+        close_reason = str(signal.get("close_reason", "") or "")
+        force_open = bool(signal.get("force_open", False))
+        force_close = bool(signal.get("force_close", False)) or close_reason in {"stop_loss", "take_profit", "terminal"}
+
+        auto_reason = _stop_or_take_reason(idx)
+        if auto_reason:
+            action = ACTION_CLOSE
+            force_close = True
 
         if fill_mode == CFG.FILL_MODE_CLOSE_T:
             fill_px = get_fill_price(df, idx, fill_mode)
-            if action == ACTION_LONG and _can_open():
+            if action == ACTION_LONG and _can_open(force=force_open):
                 _open_long(idx, fill_px)
-            elif action == ACTION_CLOSE and _can_close(idx):
+            elif action == ACTION_CLOSE and _can_close(idx, force=force_close):
                 _close_long(idx, fill_px)
         else:
             if idx < last_step:
-                if action == ACTION_LONG and _can_open():
-                    pending_order = {"type": "open_long", "fill_idx": idx + 1, "signal_idx": idx}
-                elif action == ACTION_CLOSE and _can_close(idx + 1):
-                    pending_order = {"type": "close_long", "fill_idx": idx + 1, "signal_idx": idx}
+                if action == ACTION_LONG and _can_open(force=force_open):
+                    pending_order = {
+                        "type": "open_long",
+                        "fill_idx": idx + 1,
+                        "signal_idx": idx,
+                        "force": bool(force_open),
+                    }
+                elif action == ACTION_CLOSE and _can_close(idx + 1, force=force_close):
+                    pending_order = {
+                        "type": "close_long",
+                        "fill_idx": idx + 1,
+                        "signal_idx": idx,
+                        "force": bool(force_close),
+                    }
             else:
-                if action == ACTION_LONG and _can_open():
+                if action == ACTION_LONG and _can_open(force=force_open):
                     dropped_pending_orders += 1
-                elif action == ACTION_CLOSE and _can_close(idx + 1):
+                elif action == ACTION_CLOSE and _can_close(idx + 1, force=force_close):
                     pass
 
         if fill_mode == CFG.FILL_MODE_CLOSE_T:
@@ -3043,6 +3153,8 @@ def build_test_result_with_fill_modes(agent, df, *, window_size=20, initial_cash
             slippage_rate=float(CFG.SLIPPAGE_RATE),
             cooldown_days=int(CFG.COOLDOWN_DAYS),
             min_hold_days=int(CFG.MIN_HOLD_DAYS),
+            stop_loss=float(CFG.STOP_LOSS_TEST),
+            take_profit=float(CFG.TAKE_PROFIT_TEST),
             profitable_close_cooldown_days=int(CFG.COOLDOWN_DAYS_AFTER_PROFITABLE_CLOSE),
             losing_close_cooldown_days=int(CFG.COOLDOWN_DAYS_AFTER_LOSING_CLOSE),
         )
@@ -3103,6 +3215,104 @@ def build_real_multiasset_portfolio(results, total_initial_cash, *, fill_mode=No
     agg_inv = merged[inv_cols].sum(axis=1).astype(float).tolist()
 
     return agg_dates, agg_equity, agg_inv
+
+
+def find_symbol_csv(data_dir, symbol: str):
+    symbol = str(symbol).strip().upper()
+    for path in Path(data_dir).glob("*.csv"):
+        if path.stem.upper() == symbol:
+            return path
+    return None
+
+
+def load_benchmark_price_frame(csv_path) -> pd.DataFrame:
+    header = pd.read_csv(csv_path, nrows=0)
+    cols = header.columns.tolist()
+    price_col = first_existing_col(
+        cols,
+        ["adjusted_close", "adj_close", "Adj Close", "close", "Close"],
+    )
+    if price_col is None or "Date" not in cols:
+        raise ValueError(f"Benchmark CSV must contain Date and adjusted_close/close columns: {csv_path}")
+
+    df = pd.read_csv(
+        csv_path,
+        usecols=["Date", price_col],
+        parse_dates=["Date"],
+    ).rename(columns={price_col: "price"})
+    df = df.sort_values("Date").drop_duplicates("Date", keep="last").reset_index(drop=True)
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df = df.dropna(subset=["Date", "price"])
+    if df.empty:
+        raise ValueError(f"Benchmark CSV has no usable prices: {csv_path}")
+    return df[["Date", "price"]]
+
+
+def build_benchmark_curve_from_csv(csv_path, dates, initial_value: float) -> list[float]:
+    target = pd.DataFrame({"Date": pd.to_datetime(dates)})
+    prices = load_benchmark_price_frame(csv_path)
+
+    merged = target.merge(prices, on="Date", how="left")
+    merged["price"] = merged["price"].ffill()
+
+    if merged["price"].isna().any():
+        first_missing = merged.loc[merged["price"].isna(), "Date"].iloc[0]
+        raise ValueError(
+            f"Benchmark {Path(csv_path).stem.upper()} has no price on or before "
+            f"{pd.Timestamp(first_missing).date()}"
+        )
+
+    start_price = float(merged["price"].iloc[0])
+    if start_price <= 0:
+        raise ValueError(f"Benchmark {Path(csv_path).stem.upper()} has invalid start price: {start_price}")
+
+    return (float(initial_value) * (merged["price"].astype(float) / start_price)).astype(float).tolist()
+
+
+def build_aggregate_benchmark_curves(test_dir, symbols, dates, initial_value: float, log_queue=None) -> dict[str, list[float]]:
+    curves = {}
+    for symbol in normalize_symbol_list(symbols):
+        csv_path = find_symbol_csv(test_dir, symbol)
+        if csv_path is None:
+            child_log(log_queue, f"[benchmark] Missing {symbol} CSV in {test_dir}; skipping")
+            continue
+        try:
+            curves[symbol] = build_benchmark_curve_from_csv(csv_path, dates, initial_value)
+            child_log(log_queue, f"[benchmark] Loaded {symbol} from {csv_path}")
+        except Exception as exc:
+            child_log(log_queue, f"[benchmark] Skipping {symbol}: {exc}")
+    return curves
+
+
+def compute_reference_curve_stats(curve, initial_value: float) -> dict:
+    stats = compute_portfolio_stats(
+        equity_curve=list(curve),
+        invested_curve=[float(initial_value)] * len(curve),
+        trades=[],
+        initial_value=float(initial_value),
+        buy_hold_curve=None,
+    )
+    return {
+        "total_return_pct": stats.get("total_return_pct", np.nan),
+        "annualized_return_pct": stats.get("annualized_return_pct", np.nan),
+        "max_drawdown_pct": stats.get("max_drawdown_pct", np.nan),
+        "sharpe_ratio": stats.get("sharpe_ratio", np.nan),
+    }
+
+
+def add_external_benchmark_stats(stats: dict, benchmark_curves: dict[str, list[float]], initial_value: float):
+    strategy_total_return = stats.get("total_return_pct", np.nan)
+    for symbol, curve in benchmark_curves.items():
+        ref = compute_reference_curve_stats(curve, initial_value)
+        prefix = str(symbol).lower()
+        stats[f"{prefix}_total_return_pct"] = ref["total_return_pct"]
+        stats[f"{prefix}_annualized_return_pct"] = ref["annualized_return_pct"]
+        stats[f"{prefix}_max_drawdown_pct"] = ref["max_drawdown_pct"]
+        stats[f"{prefix}_sharpe_ratio"] = ref["sharpe_ratio"]
+        if not pd.isna(strategy_total_return) and not pd.isna(ref["total_return_pct"]):
+            stats[f"alpha_over_{prefix}"] = float(strategy_total_return) - float(ref["total_return_pct"])
+        else:
+            stats[f"alpha_over_{prefix}"] = np.nan
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3425,7 +3635,12 @@ def main_loop(agent_params, train_files, test_files, output_dir, *,
         return []
 
     finished_symbols = sorted(finished_symbols)
-    aggregate_symbols = sorted(set(normalize_symbol_list(precompleted_symbols)) | set(finished_symbols))
+    benchmark_symbol_set = set(normalize_symbol_list(getattr(CFG, "AGGREGATE_BENCHMARK_SYMBOLS", [])))
+    aggregate_symbols = sorted(
+        sym
+        for sym in (set(normalize_symbol_list(precompleted_symbols)) | set(finished_symbols))
+        if sym not in benchmark_symbol_set
+    )
     child_log(
         log_queue,
         f"Rebuilding aggregation inputs from per-symbol CSV outputs "
@@ -3457,10 +3672,7 @@ def main_loop(agent_params, train_files, test_files, output_dir, *,
         use_buy_hold=True
     )
 
-    agg_curves = {"buy_hold": agg_bh}
-    agg_invested = {}
-    agg_stats_rows = []
-    agg_stats_by_mode = {}
+    mode_meta = {}
 
     agg_curve_df = pd.DataFrame({
         "Date": pd.to_datetime(agg_dates_bh),
@@ -3483,12 +3695,10 @@ def main_loop(agent_params, train_files, test_files, output_dir, *,
             merged = bh_df.merge(mode_df, on="Date", how="inner")
 
             agg_dates_use = merged["Date"].tolist()
-            agg_bh_use = merged["buy_hold"].astype(float).tolist()
             agg_eq_use = merged["eq"].astype(float).tolist()
             agg_inv_use = merged["inv"].astype(float).tolist()
         else:
             agg_dates_use = agg_dates_bh
-            agg_bh_use = agg_bh
             agg_eq_use = agg_equity_mode
             agg_inv_use = agg_inv_mode
 
@@ -3499,22 +3709,13 @@ def main_loop(agent_params, train_files, test_files, output_dir, *,
         agg_override_pct = total_overrides / total_steps * 100 if total_steps else 0.0
         total_dropped = sum(int(r["fills"][mode]["dropped_pending_orders"]) for r in results)
         total_skipped_entries = sum(int(r["fills"][mode].get("skipped_entry_filter_count", 0)) for r in results)
-
-        stats = compute_portfolio_stats(
-            equity_curve=list(agg_eq_use),
-            invested_curve=list(agg_inv_use),
-            trades=agg_trades,
-            initial_value=initial_cash,
-            buy_hold_curve=list(agg_bh_use)
-        )
-        stats["fill_mode"] = mode
-        stats["override_count"] = total_overrides
-        stats["override_pct"] = agg_override_pct
-        stats["dropped_pending_orders"] = total_dropped
-        stats["skipped_entry_filter_count"] = total_skipped_entries
-
-        agg_stats_by_mode[mode] = stats
-        agg_stats_rows.append(stats)
+        mode_meta[mode] = {
+            "trades": agg_trades,
+            "override_count": total_overrides,
+            "override_pct": agg_override_pct,
+            "dropped_pending_orders": total_dropped,
+            "skipped_entry_filter_count": total_skipped_entries,
+        }
 
         mode_df = pd.DataFrame({
             "Date": pd.to_datetime(agg_dates_use),
@@ -3524,8 +3725,42 @@ def main_loop(agent_params, train_files, test_files, output_dir, *,
 
         agg_curve_df = agg_curve_df.merge(mode_df, on="Date", how="inner")
 
+    benchmark_curves = build_aggregate_benchmark_curves(
+        CFG.TEST_DIR,
+        getattr(CFG, "AGGREGATE_BENCHMARK_SYMBOLS", []),
+        agg_curve_df["Date"].tolist(),
+        initial_cash,
+        log_queue=log_queue,
+    )
+    for symbol, curve in benchmark_curves.items():
+        agg_curve_df[f"benchmark_{symbol}"] = curve
+
+    agg_curves = {"buy_hold": agg_curve_df["buy_hold_value"].astype(float).tolist()}
+    agg_invested = {}
+    for mode in CFG.ALL_FILL_MODES:
         agg_curves[mode] = agg_curve_df[f"portfolio_value_{mode}"].astype(float).tolist()
         agg_invested[mode] = agg_curve_df[f"invested_{mode}"].astype(float).tolist()
+
+    agg_stats_rows = []
+    agg_stats_by_mode = {}
+    for mode in CFG.ALL_FILL_MODES:
+        meta = mode_meta.get(mode, {})
+        stats = compute_portfolio_stats(
+            equity_curve=agg_curve_df[f"portfolio_value_{mode}"].astype(float).tolist(),
+            invested_curve=agg_curve_df[f"invested_{mode}"].astype(float).tolist(),
+            trades=meta.get("trades", []),
+            initial_value=initial_cash,
+            buy_hold_curve=agg_curve_df["buy_hold_value"].astype(float).tolist(),
+        )
+        stats["fill_mode"] = mode
+        stats["override_count"] = int(meta.get("override_count", 0))
+        stats["override_pct"] = float(meta.get("override_pct", 0.0))
+        stats["dropped_pending_orders"] = int(meta.get("dropped_pending_orders", 0))
+        stats["skipped_entry_filter_count"] = int(meta.get("skipped_entry_filter_count", 0))
+        add_external_benchmark_stats(stats, benchmark_curves, initial_cash)
+
+        agg_stats_by_mode[mode] = stats
+        agg_stats_rows.append(stats)
 
     child_log(log_queue, "Writing aggregated_stats.csv")
     pd.DataFrame(agg_stats_rows).to_csv(
@@ -3552,7 +3787,8 @@ def main_loop(agent_params, train_files, test_files, output_dir, *,
         invested_dict=agg_invested,
         stats_by_mode=agg_stats_by_mode,
         dates=agg_curve_df["Date"].tolist(),
-        save_path=os.path.join(output_dir, "aggregated_curve.html")
+        save_path=os.path.join(output_dir, "aggregated_curve.html"),
+        benchmark_curves=benchmark_curves,
     )
     return finished_symbols
 
@@ -3580,14 +3816,17 @@ if __name__ == "__main__":
     print(f"Checkpoint directory: {CFG.MODEL_DIR}")
     print(f"Resume from checkpoint: {CFG.RESUME_FROM_CHECKPOINT}")
     print(f"Reuse saved scaler: {CFG.REUSE_SAVED_SCALER}")
+    print(f"Aggregate ETF benchmarks: {CFG.AGGREGATE_BENCHMARK_SYMBOLS}")
+    print(f"Exclude aggregate benchmarks from training: {CFG.EXCLUDE_AGGREGATE_BENCHMARKS_FROM_TRAINING}")
 
     output_dir = str(CFG.OUTPUT_DIR)
     window_size = int(CFG.WINDOW_SIZE)
     episodes = int(CFG.EPISODES)
     initial_cash = float(CFG.INITIAL_CASH)
 
-    completed_symbols = []
+    completed_symbols = read_completed_symbols_from_progress(output_dir)
     symbols_per_wave = max(1, int(CFG.NUMBER_OF_POOLS))
+    CFG.TRAIN_FILES, CFG.TEST_FILES = discover_symbol_file_pairs(CFG.TRAIN_DIR, CFG.TEST_DIR)
 
     all_pairs = [
         (symbol_from_csv_path(tr), tr, te)
@@ -3597,6 +3836,7 @@ if __name__ == "__main__":
 
     print(f"Use multiprocessing: {CFG.USE_MULTIPROCESSING}")
     print(f"Total symbols: {len(all_pairs)}")
+    print(f"Previously completed symbols: {len(completed_symbols)}")
     print(f"Symbols to run: {len(remaining_pairs)}")
     print(f"Symbols per wave: {symbols_per_wave}")
 

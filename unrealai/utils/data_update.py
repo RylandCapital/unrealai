@@ -1,23 +1,32 @@
+import argparse
 import os
+import re
+import sys
+from pathlib import Path
 import pandas as pd
 import numpy as np
-import norgatedata
 import matplotlib.pyplot as plt
 
-from scipy import stats
 from dotenv import load_dotenv
-try:
-    from utils.feature_registry import FEATURE_COLS, FUNDAMENTAL_SYMBOLS
-except ModuleNotFoundError:
-    from feature_registry import FEATURE_COLS, FUNDAMENTAL_SYMBOLS
 
-load_dotenv()
+try:
+    import norgatedata
+except ModuleNotFoundError:
+    norgatedata = None
+
+try:
+    from unrealai.utils.feature_registry import FEATURE_COLS, FUNDAMENTAL_SYMBOLS
+except ModuleNotFoundError:
+    try:
+        from utils.feature_registry import FEATURE_COLS, FUNDAMENTAL_SYMBOLS
+    except ModuleNotFoundError:
+        from feature_registry import FEATURE_COLS, FUNDAMENTAL_SYMBOLS
 
 # =============================================================================
 # CONFIG
 # =============================================================================
 START_DATE = pd.Timestamp("2010-01-01")
-TEST_DAYS = 300
+TEST_DAYS = 180
 
 # Pull a warmup window before the last saved date so rolling features remain valid
 # when appending new rows.
@@ -26,12 +35,44 @@ FEATURE_WARMUP_CALENDAR_DAYS = 365 * 3
 # Hard-break if any forward-filled internal raw series is unchanged too long.
 MAX_STALE_ROWS = 60
 
-PADDING_SETTING = norgatedata.PaddingType.NONE
-PRICE_ADJUSTMENT = norgatedata.StockPriceAdjustmentType.TOTALRETURN
+APP_DIR = Path(__file__).resolve().parents[1]
+load_dotenv(APP_DIR.parent / ".env")
+
+WINDOWS_TRAIN_DIR = r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\traindata"
+WINDOWS_TEST_DIR = r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\testdata"
+WINDOWS_GRIP_ALLOCATION_PATH = r"P:\10_CWP Trade Department\_Matrix_\code_outputs\grip_momo\grip_allocation.xlsx"
+WINDOWS_EDIP_ALLOCATION_PATH = r"P:\10_CWP Trade Department\Smitty\DSIP allocation.xlsx"
+
+
+def _default_path(windows_path: str, spark_path: Path | None = None) -> Path | None:
+    if os.name == "nt":
+        return Path(windows_path)
+    return spark_path
+
+
+def _env_path(name: str, default: Path | str | None = None) -> Path | None:
+    value = os.getenv(name)
+    if value is None or str(value).strip() == "":
+        return Path(default).expanduser() if default is not None else None
+    return Path(os.path.expandvars(str(value).strip())).expanduser()
+
+
+PADDING_SETTING = norgatedata.PaddingType.NONE if norgatedata is not None else None
+PRICE_ADJUSTMENT = (
+    norgatedata.StockPriceAdjustmentType.TOTALRETURN if norgatedata is not None else None
+)
 TIMESERIES_FORMAT = "pandas-dataframe"
 
-TRAIN_DIR = r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\traindata"
-TEST_DIR = r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\testdata"
+TRAIN_DIR = _env_path("UNREALAI_TRAIN_DIR", _default_path(WINDOWS_TRAIN_DIR, APP_DIR / "traindata"))
+TEST_DIR = _env_path("UNREALAI_TEST_DIR", _default_path(WINDOWS_TEST_DIR, APP_DIR / "testdata"))
+GRIP_ALLOCATION_PATH = _env_path(
+    "UNREALAI_GRIP_ALLOCATION_PATH",
+    _default_path(WINDOWS_GRIP_ALLOCATION_PATH),
+)
+EDIP_ALLOCATION_PATH = _env_path(
+    "UNREALAI_EDIP_ALLOCATION_PATH",
+    _default_path(WINDOWS_EDIP_ALLOCATION_PATH),
+)
 
 SECTOR_PROXY_MAP = {
     "AMZN": "XLY",
@@ -82,13 +123,104 @@ SECTOR_PROXY_MAP = {
     "QQQ":"QQQ"
 }
 
-GRIP = pd.read_excel(
-            r'P:\10_CWP Trade Department\_Matrix_\code_outputs\grip_momo\grip_allocation.xlsx',
-            header=1)[['Ticker']].dropna()['Ticker'].tolist()
 
-EDIP = pd.read_excel('P:\\10_CWP Trade Department\\Smitty\\DSIP allocation.xlsx')['Unnamed: 1'].dropna().tolist()
+def _dedupe_preserve_order(values) -> list[str]:
+    seen = set()
+    out = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
 
-TICKERS =  list(set(GRIP) ^ set(EDIP))
+
+def parse_ticker_list(value) -> list[str]:
+    if value is None:
+        return []
+
+    if isinstance(value, (list, tuple, set, pd.Series)):
+        tokens = []
+        for item in value:
+            if pd.isna(item):
+                continue
+            tokens.extend(re.split(r"[\s,;]+", str(item)))
+    else:
+        tokens = re.split(r"[\s,;]+", str(value))
+
+    tickers = []
+    for token in tokens:
+        ticker = token.strip().upper()
+        if not ticker or ticker in {"NAN", "NONE", "CASH", "TICKER", "SYMBOL"}:
+            continue
+        tickers.append(ticker)
+
+    return _dedupe_preserve_order(tickers)
+
+
+def _csv_symbols(directory: Path) -> list[str]:
+    if directory is None or not Path(directory).exists():
+        return []
+    return sorted({p.stem.upper() for p in Path(directory).glob("*.csv")})
+
+
+def _read_ticker_file(path: Path) -> list[str]:
+    return parse_ticker_list(path.read_text(encoding="utf-8"))
+
+
+def _read_grip_tickers(path: Path) -> list[str]:
+    df = pd.read_excel(path, header=1)
+    if "Ticker" not in df.columns:
+        raise ValueError(f"GRIP allocation file is missing a Ticker column: {path}")
+    return parse_ticker_list(df["Ticker"].dropna().tolist())
+
+
+def _read_edip_tickers(path: Path) -> list[str]:
+    df = pd.read_excel(path)
+    if "Unnamed: 1" in df.columns:
+        series = df["Unnamed: 1"]
+    elif len(df.columns) > 1:
+        series = df.iloc[:, 1]
+    else:
+        series = df.iloc[:, 0]
+    return parse_ticker_list(series.dropna().tolist())
+
+
+def load_configured_tickers() -> list[str]:
+    explicit_tickers = os.getenv("UNREALAI_TICKERS") or os.getenv("DATA_UPDATE_TICKERS")
+    if explicit_tickers:
+        return parse_ticker_list(explicit_tickers)
+
+    ticker_file = _env_path("UNREALAI_TICKER_FILE")
+    if ticker_file and ticker_file.exists():
+        return _read_ticker_file(ticker_file)
+
+    grip = []
+    edip = []
+
+    if GRIP_ALLOCATION_PATH and GRIP_ALLOCATION_PATH.exists():
+        grip = _read_grip_tickers(GRIP_ALLOCATION_PATH)
+
+    if EDIP_ALLOCATION_PATH and EDIP_ALLOCATION_PATH.exists():
+        edip = _read_edip_tickers(EDIP_ALLOCATION_PATH)
+
+    if grip or edip:
+        mode = os.getenv("UNREALAI_TICKER_MODE", "xor").strip().lower()
+        if mode in {"xor", "symmetric_difference", "symmetric-difference"}:
+            return sorted(set(grip) ^ set(edip))
+        if mode in {"union", "all"}:
+            return _dedupe_preserve_order(grip + edip)
+        if mode in {"intersection", "common"}:
+            return sorted(set(grip) & set(edip))
+        raise ValueError(
+            "UNREALAI_TICKER_MODE must be one of xor, union, or intersection; "
+            f"got {mode!r}"
+        )
+
+    # Spark/Linux fallback: update whatever symbols already exist locally.
+    return sorted(set(_csv_symbols(TRAIN_DIR)) | set(_csv_symbols(TEST_DIR)))
+
+
+TICKERS = load_configured_tickers()
 
 
 # =============================================================================
@@ -208,9 +340,22 @@ def rolling_momentum_score(series: pd.Series, window: int) -> pd.Series:
 
 
 def momentum_score(ts, days):
-    x = np.arange(len(ts))
-    log_ts = np.log(ts)
-    slope, intercept, r_value, p_value, std_err = stats.linregress(x, log_ts)
+    arr = np.asarray(ts, dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if len(arr) < 2 or np.any(arr <= 0):
+        return np.nan
+
+    x = np.arange(len(arr), dtype=np.float64)
+    log_ts = np.log(arr)
+    x_centered = x - x.mean()
+    y_centered = log_ts - log_ts.mean()
+    x_var = (x_centered ** 2).sum()
+    if x_var == 0:
+        return np.nan
+
+    slope = (x_centered * y_centered).sum() / x_var
+    denom = np.sqrt((x_centered ** 2).sum() * (y_centered ** 2).sum())
+    r_value = (x_centered * y_centered).sum() / denom if denom > 0 else 0.0
     annualized_slope = (np.exp(slope) ** 252 - 1) * 100
     score = annualized_slope * (r_value ** 2)
     return score
@@ -284,7 +429,18 @@ def detect_stale_columns(df: pd.DataFrame, columns, max_same_rows: int = MAX_STA
 # =============================================================================
 # NORGATE FETCH
 # =============================================================================
+def require_norgatedata():
+    if norgatedata is None:
+        raise RuntimeError(
+            "norgatedata is not installed in this Python environment. "
+            "data_update.py needs Norgate for prices and market-internal symbols. "
+            "On Spark/Linux, install and configure Norgate's Python package if available, "
+            "or run the updater on the Windows/Norgate machine and sync the generated CSVs."
+        )
+
+
 def fetch_norgate_ohlcv(symbol: str, start_date: pd.Timestamp) -> pd.DataFrame:
+    require_norgatedata()
     ts = norgatedata.price_timeseries(
         symbol,
         stock_price_adjustment_setting=PRICE_ADJUSTMENT,
@@ -306,6 +462,7 @@ def fetch_norgate_ohlcv(symbol: str, start_date: pd.Timestamp) -> pd.DataFrame:
 
 
 def fetch_norgate_close(symbol: str, start_date: pd.Timestamp) -> pd.DataFrame:
+    require_norgatedata()
     ts = norgatedata.price_timeseries(
         symbol,
         stock_price_adjustment_setting=PRICE_ADJUSTMENT,
@@ -770,12 +927,12 @@ def get_daily_equity(ticker: str, start_date: pd.Timestamp) -> pd.DataFrame:
 # =============================================================================
 # FILE / SPLIT HELPERS
 # =============================================================================
-def train_path(ticker: str) -> str:
-    return os.path.join(TRAIN_DIR, f"{ticker}.csv")
+def train_path(ticker: str) -> Path:
+    return TRAIN_DIR / f"{ticker}.csv"
 
 
-def test_path(ticker: str) -> str:
-    return os.path.join(TEST_DIR, f"{ticker}.csv")
+def test_path(ticker: str) -> Path:
+    return TEST_DIR / f"{ticker}.csv"
 
 
 def load_existing_feature_history(ticker: str) -> pd.DataFrame:
@@ -889,9 +1046,81 @@ def update_one_ticker(ticker: str):
 # =============================================================================
 # ENTRY POINT
 # =============================================================================
-if __name__ == "__main__":
-    os.makedirs(TRAIN_DIR, exist_ok=True)
-    os.makedirs(TEST_DIR, exist_ok=True)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Update UnrealAI train/test feature CSVs.")
+    parser.add_argument(
+        "--tickers",
+        help="Comma, space, or semicolon separated symbols. Overrides env/allocation/CSV discovery.",
+    )
+    parser.add_argument(
+        "--ticker-file",
+        type=Path,
+        help="Text file containing symbols separated by commas, whitespace, or semicolons.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="Update only the first N resolved tickers. Useful for smoke tests.",
+    )
+    parser.add_argument(
+        "--list-config",
+        action="store_true",
+        help="Print resolved paths and tickers without updating data.",
+    )
+    return parser.parse_args()
 
-    for ticker in TICKERS:
+
+def resolve_run_tickers(args) -> list[str]:
+    if args.tickers:
+        tickers = parse_ticker_list(args.tickers)
+    elif args.ticker_file:
+        tickers = _read_ticker_file(args.ticker_file.expanduser())
+    else:
+        tickers = list(TICKERS)
+
+    if args.limit is not None:
+        tickers = tickers[: max(args.limit, 0)]
+
+    return tickers
+
+
+def print_config(tickers: list[str]):
+    print("Resolved data_update configuration:")
+    print(f"  APP_DIR:               {APP_DIR}")
+    print(f"  TRAIN_DIR:             {TRAIN_DIR}")
+    print(f"  TEST_DIR:              {TEST_DIR}")
+    print(f"  GRIP_ALLOCATION_PATH:  {GRIP_ALLOCATION_PATH or '(not configured)'}")
+    print(f"  EDIP_ALLOCATION_PATH:  {EDIP_ALLOCATION_PATH or '(not configured)'}")
+    print(f"  norgatedata available: {norgatedata is not None}")
+    print(f"  tickers ({len(tickers)}):        {', '.join(tickers) if tickers else '(none)'}")
+    sys.stdout.flush()
+
+
+def main():
+    args = parse_args()
+    tickers = resolve_run_tickers(args)
+    print_config(tickers)
+
+    if args.list_config:
+        return
+
+    if not tickers:
+        raise RuntimeError(
+            "No tickers configured. Set UNREALAI_TICKERS, set UNREALAI_TICKER_FILE, "
+            "configure allocation Excel paths, or place existing CSVs in TRAIN_DIR/TEST_DIR."
+        )
+
+    try:
+        require_norgatedata()
+    except RuntimeError as exc:
+        raise SystemExit(f"ERROR: {exc}") from None
+
+    TRAIN_DIR.mkdir(parents=True, exist_ok=True)
+    TEST_DIR.mkdir(parents=True, exist_ok=True)
+
+    for ticker in tickers:
         update_one_ticker(ticker)
+
+
+if __name__ == "__main__":
+    main()
