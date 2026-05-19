@@ -723,6 +723,7 @@ def _build_committee_base_payload(symbol: str, env, *, raw_action: int, valid_ac
 
 NEWS_COMPANY_NAME_BY_SYMBOL = {
     "ABBV": "AbbVie",
+    "ADM": "Archer-Daniels-Midland",
     "AEM": "Agnico Eagle Mines",
     "AMAT": "Applied Materials",
     "AMD": "Advanced Micro Devices",
@@ -737,6 +738,7 @@ NEWS_COMPANY_NAME_BY_SYMBOL = {
     "CVX": "Chevron",
     "DUK": "Duke Energy",
     "EXC": "Exelon",
+    "FCX": "Freeport-McMoRan",
     "FDX": "FedEx",
     "GOOGL": "Alphabet",
     "GS": "Goldman Sachs",
@@ -762,7 +764,11 @@ NEWS_COMPANY_NAME_BY_SYMBOL = {
     "RKLB": "Rocket Lab",
     "RTX": "RTX",
     "SLB": "Schlumberger",
+    "STLD": "Steel Dynamics",
     "TJX": "TJX Companies",
+    "TMUS": "T-Mobile US",
+    "TSLA": "Tesla",
+    "VZ": "Verizon Communications",
 }
 
 
@@ -1135,6 +1141,29 @@ def read_completed_symbols_from_progress(output_dir: str) -> list[str]:
         return []
 
     return normalize_symbol_list(payload.get("completed_symbols", []))
+
+
+def infer_completed_symbols_from_outputs(output_dir: str, model_dir: str, symbols: list[str]) -> list[str]:
+    root = Path(output_dir)
+    if not root.exists():
+        return []
+
+    required_suffixes = [
+        "_train.csv",
+        "_training_diagnostics.csv",
+        "_greedy_eval.csv",
+        "_signals.csv",
+        "_stats.csv",
+        "_curves.csv",
+    ]
+
+    completed = []
+    for symbol in normalize_symbol_list(symbols):
+        has_reports = all((root / f"{symbol}{suffix}").exists() for suffix in required_suffixes)
+        if has_reports and checkpoint_exists(model_dir, symbol):
+            completed.append(symbol)
+
+    return completed
 
 
 def action_name(action: int) -> str:
@@ -3824,7 +3853,6 @@ if __name__ == "__main__":
     episodes = int(CFG.EPISODES)
     initial_cash = float(CFG.INITIAL_CASH)
 
-    completed_symbols = read_completed_symbols_from_progress(output_dir)
     symbols_per_wave = max(1, int(CFG.NUMBER_OF_POOLS))
     CFG.TRAIN_FILES, CFG.TEST_FILES = discover_symbol_file_pairs(CFG.TRAIN_DIR, CFG.TEST_DIR)
 
@@ -3832,13 +3860,22 @@ if __name__ == "__main__":
         (symbol_from_csv_path(tr), tr, te)
         for tr, te in zip(CFG.TRAIN_FILES, CFG.TEST_FILES)
     ]
+
+    all_symbols = [sym for sym, _, _ in all_pairs]
+    progress_completed_symbols = read_completed_symbols_from_progress(output_dir)
+    output_completed_symbols = infer_completed_symbols_from_outputs(output_dir, CFG.MODEL_DIR, all_symbols)
+    completed_symbols = normalize_symbol_list(progress_completed_symbols + output_completed_symbols)
     remaining_pairs = [(sym, tr, te) for sym, tr, te in all_pairs if sym not in set(completed_symbols)]
 
     print(f"Use multiprocessing: {CFG.USE_MULTIPROCESSING}")
     print(f"Total symbols: {len(all_pairs)}")
+    print(f"Completed from progress file: {len(progress_completed_symbols)}")
+    print(f"Completed from output/checkpoint files: {len(output_completed_symbols)}")
     print(f"Previously completed symbols: {len(completed_symbols)}")
     print(f"Symbols to run: {len(remaining_pairs)}")
     print(f"Symbols per wave: {symbols_per_wave}")
+    if remaining_pairs:
+        print(f"Next symbol to run: {remaining_pairs[0][0]}")
 
     if not remaining_pairs:
         print("No symbols left to run.")
