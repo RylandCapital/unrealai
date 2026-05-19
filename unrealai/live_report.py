@@ -128,12 +128,10 @@ class CFG:
     FILL_MODE_CLOSE_T = "close_t"
     FILL_MODE_OPEN_T1 = "open_t_plus_1"
     FILL_MODE_HL2_T1 = "hl2_t_plus_1"
-    FILL_MODE_OPEN_T1_DISCOUNT_ONLY = "open_t_plus_1_discount_only"
     ALL_FILL_MODES = [
         FILL_MODE_CLOSE_T,
         FILL_MODE_OPEN_T1,
         FILL_MODE_HL2_T1,
-        FILL_MODE_OPEN_T1_DISCOUNT_ONLY,
     ]
 
     # The fill mode used for the morning stance / long-vs-flat report and dashboard positioning
@@ -157,7 +155,6 @@ FILL_LABELS = {
     CFG.FILL_MODE_CLOSE_T: "Close T0",
     CFG.FILL_MODE_OPEN_T1: "Open T+1",
     CFG.FILL_MODE_HL2_T1: "HL2 T+1",
-    CFG.FILL_MODE_OPEN_T1_DISCOUNT_ONLY: "Open T+1 Discount Only",
 }
 
 OVERWATCH_LOG_COLUMNS = [
@@ -1219,7 +1216,7 @@ def generate_signal_log(agent, df, *, window_size=20, initial_cash=100_000, star
 def get_fill_price(df, idx: int, fill_mode: str) -> float:
     if fill_mode == CFG.FILL_MODE_CLOSE_T:
         return float(df["adjusted_close"].iloc[idx])
-    if fill_mode in (CFG.FILL_MODE_OPEN_T1, CFG.FILL_MODE_OPEN_T1_DISCOUNT_ONLY):
+    if fill_mode == CFG.FILL_MODE_OPEN_T1:
         return float(df["eval_open"].iloc[idx])
     if fill_mode == CFG.FILL_MODE_HL2_T1:
         return float((df["eval_high"].iloc[idx] + df["eval_low"].iloc[idx]) / 2.0)
@@ -1263,7 +1260,7 @@ def _read_benchmark_price_series(symbol: str) -> Optional[pd.DataFrame]:
     return df
 
 
-def apply_aggregate_benchmark_basket(agg_curve: pd.DataFrame) -> pd.DataFrame:
+def add_aggregate_benchmarks(agg_curve: pd.DataFrame) -> pd.DataFrame:
     out = agg_curve.copy()
     if out.empty:
         return out
@@ -1287,7 +1284,7 @@ def apply_aggregate_benchmark_basket(agg_curve: pd.DataFrame) -> pd.DataFrame:
             "Set AGGREGATE_BENCHMARK_SYMBOLS to CSVs available in DATA_DIR."
         )
 
-    norm_cols = []
+    loaded_benchmark_cols = []
     for symbol in loaded_symbols:
         prices = pd.to_numeric(bench[symbol], errors="coerce").ffill()
         first_valid = prices.dropna()
@@ -1296,23 +1293,15 @@ def apply_aggregate_benchmark_basket(agg_curve: pd.DataFrame) -> pd.DataFrame:
             continue
         norm_col = f"benchmark_{symbol}_index"
         bench[norm_col] = prices / float(first_valid.iloc[0])
-        norm_cols.append(norm_col)
+        loaded_benchmark_cols.append((symbol, norm_col))
 
-    if not norm_cols:
+    if not loaded_benchmark_cols:
         raise RuntimeError("Aggregate benchmark series could not be normalized.")
 
-    benchmark_index = bench[norm_cols].mean(axis=1, skipna=True)
     capital_base = float(getattr(CFG, "AGGREGATE_INITIAL_CASH", CFG.INITIAL_CASH))
 
-    for symbol in loaded_symbols:
-        norm_col = f"benchmark_{symbol}_index"
-        if norm_col in bench.columns:
-            out[f"benchmark_{symbol}"] = capital_base * bench[norm_col]
-    out["benchmark_index"] = benchmark_index
-    out["benchmark_symbols"] = ",".join(loaded_symbols)
-    out["buy_hold"] = capital_base * benchmark_index
-    out["benchmark_return_pct"] = (benchmark_index - 1.0) * 100.0
-    out["alpha_pct"] = out["portfolio_return_pct"] - out["benchmark_return_pct"]
+    for symbol, norm_col in loaded_benchmark_cols:
+        out[f"benchmark_{symbol}"] = capital_base * bench[norm_col]
     return out
 
 
@@ -1436,12 +1425,7 @@ def replay_signals_with_fill_mode(
         cooldown_remaining = win_cd if float(pct) > 0.0 else loss_cd
 
     def _entry_filter_passes(signal_idx: int, fill_idx: int, fill_px: float) -> bool:
-        if fill_mode != CFG.FILL_MODE_OPEN_T1_DISCOUNT_ONLY:
-            return True
-        if fill_idx <= signal_idx:
-            return False
-        signal_close = float(closes[signal_idx])
-        return float(fill_px) < signal_close
+        return True
 
     def _stop_or_take_reason(idx: int) -> str:
         if position != 1 or entry_price <= 0:
@@ -1964,12 +1948,23 @@ def aggregate_curve_tables(symbol_curve_tables: dict[str, pd.DataFrame]) -> pd.D
 
     merged = merged.sort_values("Date").reset_index(drop=True)
 
-    out = pd.DataFrame({"Date": merged["Date"]})
-    bh_cols = [c for c in merged.columns if c.startswith("buy_hold__")]
     primary_live_cols = [c for c in merged.columns if c.startswith("primary_live__")]
     pos_cols = [c for c in merged.columns if c.startswith("primary_position__")]
 
-    out["buy_hold"] = merged[bh_cols].sum(axis=1, skipna=True)
+    complete_mask = merged[primary_live_cols].notna().all(axis=1)
+    dropped_rows = int((~complete_mask).sum())
+    if dropped_rows:
+        dropped_dates = pd.to_datetime(merged.loc[~complete_mask, "Date"], errors="coerce")
+        dropped_preview = ", ".join(dropped_dates.dt.strftime("%Y-%m-%d").dropna().head(10).tolist())
+        more = "..." if dropped_rows > 10 else ""
+        print(
+            f"[warn] aggregate curve dropped {dropped_rows} incomplete date rows "
+            f"where one or more symbol sleeves were missing: {dropped_preview}{more}"
+        )
+    merged = merged.loc[complete_mask].reset_index(drop=True)
+
+    out = pd.DataFrame({"Date": merged["Date"]})
+
     out["primary_live"] = merged[primary_live_cols].sum(axis=1, skipna=True)
     out["open_positions"] = merged[pos_cols].sum(axis=1, skipna=True)
     out["symbols_reporting"] = merged[primary_live_cols].notna().sum(axis=1)
@@ -1983,7 +1978,7 @@ def aggregate_curve_tables(symbol_curve_tables: dict[str, pd.DataFrame]) -> pd.D
     source_capital_base = float(CFG.INITIAL_CASH) * reporting
     scale = aggregate_capital_base / source_capital_base
 
-    equity_cols = ["buy_hold", "primary_live"] + list(CFG.ALL_FILL_MODES)
+    equity_cols = ["primary_live"] + list(CFG.ALL_FILL_MODES)
     for col in equity_cols:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce") * scale
@@ -1991,10 +1986,8 @@ def aggregate_curve_tables(symbol_curve_tables: dict[str, pd.DataFrame]) -> pd.D
     out["aggregate_initial_cash"] = aggregate_capital_base
     out["model_symbol_allocation"] = aggregate_capital_base / reporting
     out["portfolio_return_pct"] = (out["primary_live"] / aggregate_capital_base - 1.0) * 100.0
-    out["benchmark_return_pct"] = (out["buy_hold"] / aggregate_capital_base - 1.0) * 100.0
-    out["alpha_pct"] = out["portfolio_return_pct"] - out["benchmark_return_pct"]
     out["drawdown_pct"] = compute_drawdown_pct_series(out["primary_live"])
-    out = apply_aggregate_benchmark_basket(out)
+    out = add_aggregate_benchmarks(out)
 
     return out
 
@@ -2237,10 +2230,20 @@ def make_symbol_figure(symbol: str, curve_df: pd.DataFrame, raw_df: pd.DataFrame
 
 def make_aggregate_figure(agg_curve: pd.DataFrame) -> go.Figure:
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.72, 0.28])
-    benchmark_name = "Aggregate Benchmark"
-    if "benchmark_symbols" in agg_curve.columns and not agg_curve["benchmark_symbols"].dropna().empty:
-        benchmark_name = f"Aggregate Benchmark ({agg_curve['benchmark_symbols'].dropna().iloc[-1]})"
-    fig.add_trace(go.Scatter(x=agg_curve["Date"], y=agg_curve["buy_hold"], mode="lines", name=benchmark_name), row=1, col=1)
+    default_benchmark = str(CFG.AGGREGATE_BENCHMARK_SYMBOLS[0]) if CFG.AGGREGATE_BENCHMARK_SYMBOLS else ""
+    for col in [c for c in agg_curve.columns if c.startswith("benchmark_")]:
+        symbol = col.removeprefix("benchmark_")
+        fig.add_trace(
+            go.Scatter(
+                x=agg_curve["Date"],
+                y=agg_curve[col],
+                mode="lines",
+                name=f"Benchmark {symbol}",
+                visible=True if symbol == default_benchmark else "legendonly",
+            ),
+            row=1,
+            col=1,
+        )
     fig.add_trace(go.Scatter(x=agg_curve["Date"], y=agg_curve["primary_live"], mode="lines", name=f"Aggregate {get_fill_mode_display_name(CFG.PRIMARY_REPORT_FILL_MODE)} Live", line=dict(width=4)), row=1, col=1)
     for mode in CFG.ALL_FILL_MODES:
         fig.add_trace(

@@ -31,7 +31,6 @@ FILL_LABELS = {
     "close_t": "Close T0",
     "open_t_plus_1": "Close T+1 Open",
     "hl2_t_plus_1": "HL2 T+1",
-    "open_t_plus_1_discount_only": "Open T+1 Discount Only",
 }
 
 MODEL_CONFIG = {
@@ -83,6 +82,21 @@ def inject_css() -> None:
     st.markdown(
         """
         <style>
+            :root {
+                color-scheme: dark;
+            }
+            .stApp,
+            [data-testid="stAppViewContainer"],
+            [data-testid="stHeader"] {
+                background: #0b0f14 !important;
+                color: #e8edf2 !important;
+            }
+            [data-testid="stToolbar"] {
+                color: #e8edf2 !important;
+            }
+            [data-testid="stDecoration"] {
+                background: #ff4b4b !important;
+            }
             [data-testid="stSidebar"], [data-testid="collapsedControl"] {
                 display: none !important;
             }
@@ -93,6 +107,7 @@ def inject_css() -> None:
             }
             html, body, [class*="css"] {
                 font-size: 13px;
+                color: #e8edf2;
             }
             .app-title {
                 font-size: 3.0rem;
@@ -100,6 +115,7 @@ def inject_css() -> None:
                 line-height: 1.05;
                 margin: 0 0 0.20rem 0;
                 padding: 0;
+                color: #f4f7fb;
             }
             .subnote {
                 color: rgba(255,255,255,0.78);
@@ -117,12 +133,12 @@ def inject_css() -> None:
                 padding-right: 0;
             }
             .kpi-card {
-                background: rgba(255,255,255,0.02);
+                background: #111821;
+                border: 1px solid rgba(255,255,255,0.07);
                 border-radius: 12px;
                 padding: 0.60rem 0.72rem 0.54rem 0.72rem;
                 min-height: 84px;
                 margin-bottom: 0.45rem;
-                box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02);
             }
             .kpi-label {
                 font-size: 0.74rem;
@@ -146,11 +162,13 @@ def inject_css() -> None:
                 font-size: 1.18rem;
                 font-weight: 700;
                 margin: 0.20rem 0 0.35rem 0;
+                color: #f4f7fb;
             }
             .chart-title {
                 font-size: 1.00rem;
                 font-weight: 700;
                 margin: 0.25rem 0 0.10rem 0;
+                color: #f4f7fb;
             }
             .range-wrap {
                 margin: 0.10rem 0 0.25rem 0;
@@ -165,12 +183,12 @@ def inject_css() -> None:
                 font-size: 0.84rem;
             }
             .activity-box {
-                background: rgba(255,255,255,0.02);
+                background: #111821;
+                border: 1px solid rgba(255,255,255,0.07);
                 border-radius: 12px;
                 padding: 0.85rem 0.95rem 0.80rem 0.95rem;
                 min-height: 180px;
                 margin-bottom: 0.55rem;
-                box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02);
             }
             .activity-box-title {
                 font-size: 1.00rem;
@@ -210,6 +228,26 @@ def inject_css() -> None:
             div[data-testid="stRadio"] > div {
                 flex-direction: row;
                 gap: 0.5rem;
+            }
+            div[data-testid="stRadio"] label {
+                background: #111821;
+                border: 1px solid rgba(255,255,255,0.12);
+                color: #e8edf2;
+            }
+            div[data-testid="stDateInput"] input,
+            div[data-testid="stTextInput"] input {
+                background: #111821 !important;
+                color: #e8edf2 !important;
+                border-color: rgba(255,255,255,0.16) !important;
+            }
+            div[data-testid="stDataFrame"] {
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 8px;
+                overflow: hidden;
+            }
+            .stAlert {
+                background: #211419 !important;
+                color: #ffd7dc !important;
             }
         </style>
         """,
@@ -281,6 +319,29 @@ def maybe_col(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
     return None
 
 
+def get_available_benchmark_symbols(df: pd.DataFrame) -> list[str]:
+    symbols = []
+    for col in df.columns:
+        if not str(col).startswith("benchmark_"):
+            continue
+        symbol = str(col).removeprefix("benchmark_").upper()
+        if symbol and symbol not in {"EQUITY", "RETURN_PCT", "DRAWDOWN_PCT"}:
+            symbols.append(symbol)
+    return sorted(symbols)
+
+
+def get_benchmark_col(df: pd.DataFrame, benchmark_symbol: str) -> Optional[str]:
+    symbol = str(benchmark_symbol).strip().upper()
+    if not symbol:
+        return None
+    return maybe_col(df, [f"benchmark_{symbol}"])
+
+
+def get_benchmark_label(benchmark_symbol: str) -> str:
+    symbol = str(benchmark_symbol).strip().upper()
+    return f"Benchmark {symbol}" if symbol else "Benchmark"
+
+
 def get_date_col(df: pd.DataFrame) -> Optional[str]:
     return maybe_col(df, ["date", "Date"])
 
@@ -309,8 +370,6 @@ def get_fill_series_col(df: pd.DataFrame, fill_mode: str, *, prefer_primary_alia
         candidates.extend(["equity_open_t_plus_1", "open_t_plus_1"])
     elif fill_mode == "hl2_t_plus_1":
         candidates.extend(["equity_hl2_t_plus_1", "hl2_t_plus_1"])
-    elif fill_mode == "open_t_plus_1_discount_only":
-        candidates.extend(["equity_open_t_plus_1_discount_only", "open_t_plus_1_discount_only"])
 
     if prefer_primary_alias:
         candidates.append("equity_primary_live")
@@ -464,28 +523,35 @@ def build_aggregate_from_symbol_timeseries(sym_ts: pd.DataFrame) -> pd.DataFrame
         return pd.DataFrame()
 
     dcol = get_date_col(sym_ts)
-    if dcol is None:
+    sym_col = get_symbol_col(sym_ts)
+    if dcol is None or sym_col is None:
         return pd.DataFrame()
 
     work = sym_ts.copy()
     work[dcol] = pd.to_datetime(work[dcol], errors="coerce")
+    work[sym_col] = work[sym_col].astype(str).str.strip().str.upper()
     work = work.dropna(subset=[dcol]).copy()
     if work.empty:
         return pd.DataFrame()
 
+    expected_symbols = set(work[sym_col].dropna().astype(str).unique())
+    date_symbols = work.groupby(dcol)[sym_col].agg(lambda s: set(s.dropna().astype(str)))
+    complete_dates = date_symbols[date_symbols.map(lambda symbols: symbols == expected_symbols)].index
+    work_complete = work[work[dcol].isin(complete_dates)].copy()
+    if work_complete.empty:
+        return pd.DataFrame()
+
     result = (
-        work[[dcol]]
+        work_complete[[dcol]]
         .drop_duplicates()
         .sort_values(dcol)
         .reset_index(drop=True)
     )
 
     metric_map = {
-        "buy_hold": ["benchmark_equity", "buy_hold", "equity_buy_hold"],
         "close_t": ["equity_close_t", "close_t", "equity"],
         "open_t_plus_1": ["equity_open_t_plus_1", "open_t_plus_1", "primary_live"],
         "hl2_t_plus_1": ["equity_hl2_t_plus_1", "hl2_t_plus_1"],
-        "open_t_plus_1_discount_only": ["equity_open_t_plus_1_discount_only", "open_t_plus_1_discount_only"],
     }
 
     for out_col, candidates in metric_map.items():
@@ -493,20 +559,31 @@ def build_aggregate_from_symbol_timeseries(sym_ts: pd.DataFrame) -> pd.DataFrame
         if src_col is None:
             continue
 
-        tmp = work[[dcol]].copy()
-        tmp[out_col] = pd.to_numeric(work[src_col], errors="coerce")
-        agg_series = tmp.groupby(dcol, dropna=True)[out_col].sum(min_count=1).reset_index()
+        tmp = work_complete[[sym_col, dcol, src_col]].copy()
+        tmp[src_col] = pd.to_numeric(tmp[src_col], errors="coerce")
+        pivot = tmp.pivot_table(index=dcol, columns=sym_col, values=src_col, aggfunc="last").sort_index()
+        agg_series = pivot.sum(axis=1, min_count=1).rename(out_col).reset_index()
         result = result.merge(agg_series, on=dcol, how="left")
 
-    stance_work = add_stance_column(work)
+    stance_work = add_stance_column(work_complete)
     if "activity_stance" in stance_work.columns:
-        tmp = stance_work[[dcol]].copy()
+        tmp = stance_work[[sym_col, dcol]].copy()
         tmp["open_positions"] = stance_work["activity_stance"].eq("LONG").astype(int)
-        open_pos = tmp.groupby(dcol, dropna=True)["open_positions"].sum().reset_index()
+        pos_pivot = tmp.pivot_table(index=dcol, columns=sym_col, values="open_positions", aggfunc="last").sort_index()
+        open_pos = pos_pivot.sum(axis=1, min_count=1).rename("open_positions").reset_index()
         result = result.merge(open_pos, on=dcol, how="left")
 
-    reporting = work.groupby(dcol, dropna=True).size().reset_index(name="symbols_reporting")
+    reporting_work = work_complete[[sym_col, dcol]].copy()
+    reporting_work["_present"] = 1
+    reporting_pivot = reporting_work.pivot_table(index=dcol, columns=sym_col, values="_present", aggfunc="last").sort_index()
+    reporting = reporting_pivot.notna().sum(axis=1).rename("symbols_reporting").reset_index()
     result = result.merge(reporting, on=dcol, how="left")
+
+    reporting_count = pd.to_numeric(result["symbols_reporting"], errors="coerce").replace(0, np.nan)
+    initial_reporting = reporting_count.dropna().iloc[0] if reporting_count.notna().any() else np.nan
+    if pd.notna(initial_reporting) and initial_reporting > 0:
+        result["aggregate_initial_cash"] = float(initial_reporting) * 100_000_000.0
+        result["model_symbol_allocation"] = result["aggregate_initial_cash"] / reporting_count
 
     return result.sort_values(dcol).reset_index(drop=True)
 
@@ -524,7 +601,17 @@ def apply_model_filter(bundle: dict, model_symbols: list[str]) -> dict:
     out["symbol_metrics"] = symbol_metrics
     out["symbol_timeseries"] = symbol_timeseries
     out["trade_log"] = trade_log
-    out["aggregate_timeseries"] = build_aggregate_from_symbol_timeseries(symbol_timeseries)
+    aggregate = build_aggregate_from_symbol_timeseries(symbol_timeseries)
+    source_agg = bundle.get("aggregate_timeseries", pd.DataFrame())
+    dcol = get_date_col(aggregate)
+    source_dcol = get_date_col(source_agg)
+    benchmark_cols = [c for c in source_agg.columns if str(c).startswith("benchmark_")]
+    if dcol and source_dcol and benchmark_cols:
+        benchmark_frame = source_agg[[source_dcol] + benchmark_cols].copy()
+        if source_dcol != dcol:
+            benchmark_frame = benchmark_frame.rename(columns={source_dcol: dcol})
+        aggregate = aggregate.merge(benchmark_frame, on=dcol, how="left")
+    out["aggregate_timeseries"] = aggregate
 
     return out
 
@@ -603,7 +690,7 @@ def compute_model_saved_date(df: pd.DataFrame) -> pd.Series:
     return result
 
 
-def build_overview_metrics(filtered: dict) -> list[tuple[str, str]]:
+def build_overview_metrics(filtered: dict, benchmark_symbol: str) -> list[tuple[str, str]]:
     agg = filtered["aggregate_timeseries"]
     latest_snapshot = filtered.get("latest_snapshot", pd.DataFrame())
     trades = filtered["trade_log"]
@@ -630,7 +717,7 @@ def build_overview_metrics(filtered: dict) -> list[tuple[str, str]]:
     if dcol and not agg.empty:
         metrics["As Of"] = pd.to_datetime(agg[dcol].iloc[-1], errors="coerce").strftime("%Y-%m-%d")
 
-    bench_col = maybe_col(agg, ["buy_hold", "benchmark_equity", "benchmark"])
+    bench_col = get_benchmark_col(agg, benchmark_symbol)
     primary_col = get_fill_series_col(agg, primary_fill_mode, prefer_primary_alias=True)
 
     if primary_col and not agg.empty:
@@ -674,11 +761,11 @@ def build_overview_metrics(filtered: dict) -> list[tuple[str, str]]:
         ("Trades", fmt_num(metrics["Trades"], 0)),
         ("Win Rate", fmt_pct(metrics["Win Rate"])),
         ("Portfolio Return", fmt_pct(metrics["Portfolio Return"])),
-        ("Benchmark Return", fmt_pct(metrics["Benchmark Return"])),
+        (f"{get_benchmark_label(benchmark_symbol)} Return", fmt_pct(metrics["Benchmark Return"])),
         ("Alpha", fmt_pct(metrics["Alpha"])),
         ("Capture", fmt_ratio(metrics["Capture"])),
         ("Max Drawdown", fmt_pct(metrics["Max Drawdown"])),
-        ("Benchmark Drawdown", fmt_pct(metrics["Benchmark Drawdown"])),
+        (f"{get_benchmark_label(benchmark_symbol)} Drawdown", fmt_pct(metrics["Benchmark Drawdown"])),
         ("Drawdown Capture", fmt_ratio(metrics["Drawdown Capture"])),
     ]
 
@@ -702,7 +789,7 @@ def render_kpis(metrics: list[tuple[str, str]]) -> None:
         col.markdown(kpi_card(label, value), unsafe_allow_html=True)
 
 
-def make_portfolio_chart(agg: pd.DataFrame, primary_fill_mode: str) -> go.Figure:
+def make_portfolio_chart(agg: pd.DataFrame, primary_fill_mode: str, benchmark_symbol: str) -> go.Figure:
     fig = go.Figure()
     if agg.empty:
         return fig
@@ -712,12 +799,10 @@ def make_portfolio_chart(agg: pd.DataFrame, primary_fill_mode: str) -> go.Figure
         return fig
 
     x = agg[dcol]
-    bench_col = maybe_col(agg, ["buy_hold", "benchmark_equity", "benchmark"])
+    bench_col = get_benchmark_col(agg, benchmark_symbol)
 
     if bench_col:
-        benchmark_name = "Benchmark Return"
-        if "benchmark_symbols" in agg.columns and not agg["benchmark_symbols"].dropna().empty:
-            benchmark_name = f"Benchmark Return ({agg['benchmark_symbols'].dropna().iloc[-1]})"
+        benchmark_name = get_benchmark_label(benchmark_symbol)
         fig.add_trace(go.Scatter(x=x, y=to_return_pct(agg[bench_col]), mode="lines", name=benchmark_name, line=dict(width=2.4)))
 
     for fill_mode in FILL_LABELS:
@@ -767,8 +852,11 @@ def make_open_positions_chart(agg: pd.DataFrame) -> go.Figure:
 
     reporting_col = maybe_col(agg, ["symbols_reporting"])
     avg_exposure = np.nan
+    max_reporting = float(np.nanmax(positions.to_numpy(dtype=float))) if positions.notna().any() else 0.0
     if reporting_col is not None:
         reporting = pd.to_numeric(agg[reporting_col], errors="coerce").replace(0, np.nan)
+        if reporting.notna().any():
+            max_reporting = max(max_reporting, float(reporting.max()))
         exposure_pct = (positions / reporting) * 100.0
         avg_exposure = float(exposure_pct.dropna().mean()) if exposure_pct.notna().any() else np.nan
         if pd.notna(avg_exposure):
@@ -790,7 +878,8 @@ def make_open_positions_chart(agg: pd.DataFrame) -> go.Figure:
         margin=dict(l=10, r=10, t=10, b=10),
         showlegend=pd.notna(avg_exposure),
     )
-    fig.update_yaxes(title_text="Positions", secondary_y=False)
+    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+    fig.update_yaxes(title_text="Positions", range=[0, max(max_reporting, 1)], secondary_y=False)
     fig.update_yaxes(title_text="Exposure %", range=[0, 100], ticksuffix="%", secondary_y=True)
     return fig
 
@@ -948,6 +1037,105 @@ def convert_for_display(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def build_reporting_gaps_table(filtered: dict) -> pd.DataFrame:
+    sym_ts = filtered["symbol_timeseries"]
+    sym_col = get_symbol_col(sym_ts)
+    dcol = get_date_col(sym_ts)
+    primary_fill_mode = get_primary_fill_mode(filtered)
+    equity_col = get_fill_series_col(sym_ts, primary_fill_mode, prefer_primary_alias=True)
+    if sym_ts.empty or sym_col is None or dcol is None or equity_col is None:
+        return pd.DataFrame()
+
+    work = sym_ts[[sym_col, dcol, equity_col]].copy()
+    work[sym_col] = work[sym_col].astype(str).str.strip().str.upper()
+    work[dcol] = pd.to_datetime(work[dcol], errors="coerce")
+    work[equity_col] = pd.to_numeric(work[equity_col], errors="coerce")
+    work = work.dropna(subset=[sym_col, dcol]).copy()
+    if work.empty:
+        return pd.DataFrame()
+
+    pivot = work.pivot_table(index=dcol, columns=sym_col, values=equity_col, aggfunc="last").sort_index()
+    all_symbols = list(pivot.columns)
+    rows = []
+    prev_present: set[str] | None = None
+    for date, values in pivot.iterrows():
+        present = set(values.dropna().index.astype(str))
+        missing = sorted(set(all_symbols) - present)
+        lost = sorted(prev_present - present) if prev_present is not None else []
+        gained = sorted(present - prev_present) if prev_present is not None else []
+        if missing or lost or gained:
+            rows.append(
+                {
+                    "date": date,
+                    "symbols_reporting": len(present),
+                    "missing_count": len(missing),
+                    "missing_symbols": ", ".join(missing),
+                    "lost_since_prior_date": ", ".join(lost),
+                    "gained_since_prior_date": ", ".join(gained),
+                }
+            )
+        prev_present = present
+
+    return pd.DataFrame(rows)
+
+
+def build_daily_move_attribution_table(filtered: dict, limit: int = 12) -> pd.DataFrame:
+    sym_ts = filtered["symbol_timeseries"]
+    sym_col = get_symbol_col(sym_ts)
+    dcol = get_date_col(sym_ts)
+    primary_fill_mode = get_primary_fill_mode(filtered)
+    equity_col = get_fill_series_col(sym_ts, primary_fill_mode, prefer_primary_alias=True)
+    if sym_ts.empty or sym_col is None or dcol is None or equity_col is None:
+        return pd.DataFrame()
+
+    work = sym_ts[[sym_col, dcol, equity_col]].copy()
+    work[sym_col] = work[sym_col].astype(str).str.strip().str.upper()
+    work[dcol] = pd.to_datetime(work[dcol], errors="coerce")
+    work[equity_col] = pd.to_numeric(work[equity_col], errors="coerce")
+    work = work.dropna(subset=[sym_col, dcol]).copy()
+    if work.empty:
+        return pd.DataFrame()
+
+    pivot = work.pivot_table(index=dcol, columns=sym_col, values=equity_col, aggfunc="last").sort_index()
+    complete_mask = pivot.notna().all(axis=1)
+    pivot = pivot.loc[complete_mask].copy()
+    if pivot.empty:
+        return pd.DataFrame()
+
+    reporting = pivot.notna().sum(axis=1).replace(0, np.nan)
+    aggregate = pivot.sum(axis=1, min_count=1)
+    aggregate_return = to_return_pct(aggregate)
+    daily_change = aggregate_return.diff()
+    base_equity = float(aggregate.dropna().iloc[0]) if aggregate.notna().any() else np.nan
+    if pd.isna(base_equity) or base_equity == 0:
+        return pd.DataFrame()
+
+    rows = []
+    for idx in range(1, len(pivot.index)):
+        date = pivot.index[idx]
+        prev_date = pivot.index[idx - 1]
+        deltas = ((pivot.iloc[idx] - pivot.iloc[idx - 1]) / base_equity * 100.0).dropna().sort_values()
+        top_negative = ", ".join([f"{sym} {val:+.2f} pts" for sym, val in deltas.head(5).items()])
+        prev_present = set(pivot.columns[pivot.iloc[idx - 1].notna()])
+        present = set(pivot.columns[pivot.iloc[idx].notna()])
+        rows.append(
+            {
+                "date": date,
+                "previous_date": prev_date,
+                "aggregate_return_pct": aggregate_return.iloc[idx],
+                "daily_point_change": daily_change.iloc[idx],
+                "symbols_reporting": int(reporting.iloc[idx]) if pd.notna(reporting.iloc[idx]) else np.nan,
+                "lost_since_prior_date": ", ".join(sorted(prev_present - present)),
+                "top_negative_contributors": top_negative,
+            }
+        )
+
+    out = pd.DataFrame(rows).replace([np.inf, -np.inf], np.nan).dropna(subset=["daily_point_change"])
+    if out.empty:
+        return out
+    return out.sort_values("daily_point_change", ascending=True).head(limit).reset_index(drop=True)
+
+
 def display_trade_table(df: pd.DataFrame) -> None:
     if df.empty:
         st.info("No trades in the selected date range.")
@@ -978,15 +1166,15 @@ def render_header(report_start: str, start_dt: pd.Timestamp, end_dt: pd.Timestam
     )
 
 
-def render_overview(filtered: dict) -> None:
+def render_overview(filtered: dict, benchmark_symbol: str) -> None:
     st.markdown("<div class='section-title'>Overview</div>", unsafe_allow_html=True)
-    render_kpis(build_overview_metrics(filtered))
+    render_kpis(build_overview_metrics(filtered, benchmark_symbol))
 
     agg = filtered["aggregate_timeseries"]
     primary_fill_mode = get_primary_fill_mode(filtered)
 
-    st.markdown("<div class='chart-title'>Portfolio vs Benchmark</div>", unsafe_allow_html=True)
-    st.plotly_chart(make_portfolio_chart(agg, primary_fill_mode), use_container_width=True, config={"displayModeBar": False})
+    st.markdown(f"<div class='chart-title'>Portfolio vs {get_benchmark_label(benchmark_symbol)}</div>", unsafe_allow_html=True)
+    st.plotly_chart(make_portfolio_chart(agg, primary_fill_mode, benchmark_symbol), use_container_width=True, config={"displayModeBar": False})
 
     st.markdown("<div class='chart-title'>Open Positions</div>", unsafe_allow_html=True)
     st.plotly_chart(make_open_positions_chart(agg), use_container_width=True, config={"displayModeBar": False})
@@ -1205,7 +1393,6 @@ def render_diagnostics(filtered: dict) -> None:
             ("close_t", "Close T0"),
             ("open_t_plus_1", "Close T+1 Open"),
             ("hl2_t_plus_1", "HL2 T+1"),
-            ("open_t_plus_1_discount_only", "Open T+1 Discount Only"),
         ]:
             if key in agg.columns:
                 ret = to_return_pct(agg[key]).iloc[-1]
@@ -1215,6 +1402,16 @@ def render_diagnostics(filtered: dict) -> None:
             st.markdown("<div class='chart-title'>Fill Mode Snapshot</div>", unsafe_allow_html=True)
             fill_df = pd.DataFrame(rows)
             st.dataframe(convert_for_display(fill_df), use_container_width=True, hide_index=True)
+
+    daily_moves = build_daily_move_attribution_table(filtered)
+    if not daily_moves.empty:
+        st.markdown("<div class='chart-title'>Largest Daily Aggregate Drops</div>", unsafe_allow_html=True)
+        st.dataframe(convert_for_display(daily_moves), use_container_width=True, hide_index=True)
+
+    reporting_gaps = build_reporting_gaps_table(filtered)
+    if not reporting_gaps.empty:
+        st.markdown("<div class='chart-title'>Reporting Gaps</div>", unsafe_allow_html=True)
+        st.dataframe(convert_for_display(reporting_gaps), use_container_width=True, hide_index=True)
 
 
 def render_model_toggle() -> str:
@@ -1280,7 +1477,10 @@ def main() -> None:
     report_start = model_bundle["summary"].get("report_start_date") or pd.to_datetime(min_dt).strftime("%Y-%m-%d")
 
     st.markdown("<div class='range-wrap'></div>", unsafe_allow_html=True)
-    date_col, refresh_col, _ = st.columns([2.2, 0.9, 6.9], gap="small")
+    benchmark_options = get_available_benchmark_symbols(model_bundle["aggregate_timeseries"])
+    default_benchmark_idx = benchmark_options.index("EQAL") if "EQAL" in benchmark_options else 0
+
+    date_col, benchmark_col, refresh_col, _ = st.columns([2.2, 1.2, 0.9, 5.7], gap="small")
     with date_col:
         st.markdown("<div class='range-label'>Date Range</div>", unsafe_allow_html=True)
         date_range = st.date_input(
@@ -1290,6 +1490,18 @@ def main() -> None:
             max_value=max_dt.date(),
             label_visibility="collapsed",
         )
+    with benchmark_col:
+        st.markdown("<div class='range-label'>Benchmark</div>", unsafe_allow_html=True)
+        if benchmark_options:
+            selected_benchmark = st.selectbox(
+                "Benchmark",
+                options=benchmark_options,
+                index=default_benchmark_idx,
+                label_visibility="collapsed",
+            )
+        else:
+            selected_benchmark = ""
+            st.caption("No benchmark columns")
     with refresh_col:
         st.markdown("<div class='range-label'>&nbsp;</div>", unsafe_allow_html=True)
         if st.button("App Refresh", key="app_refresh", use_container_width=True):
@@ -1308,7 +1520,7 @@ def main() -> None:
 
     tabs = st.tabs(["Overview", "Activity", "Symbols", "Attribution", "Trades", "Diagnostics"])
     with tabs[0]:
-        render_overview(filtered)
+        render_overview(filtered, selected_benchmark)
     with tabs[1]:
         render_activity(filtered)
     with tabs[2]:
