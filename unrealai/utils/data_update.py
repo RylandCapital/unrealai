@@ -27,6 +27,7 @@ except ModuleNotFoundError:
 # =============================================================================
 START_DATE = pd.Timestamp("2010-01-01")
 TEST_DAYS = 180
+ALWAYS_RUN_TICKERS = ["QQQE", "RSP", "EQAL"]
 
 # Pull a warmup window before the last saved date so rolling features remain valid
 # when appending new rows.
@@ -185,15 +186,7 @@ def _read_edip_tickers(path: Path) -> list[str]:
     return parse_ticker_list(series.dropna().tolist())
 
 
-def load_configured_tickers() -> list[str]:
-    explicit_tickers = os.getenv("UNREALAI_TICKERS") or os.getenv("DATA_UPDATE_TICKERS")
-    if explicit_tickers:
-        return parse_ticker_list(explicit_tickers)
-
-    ticker_file = _env_path("UNREALAI_TICKER_FILE")
-    if ticker_file and ticker_file.exists():
-        return _read_ticker_file(ticker_file)
-
+def load_allocation_tickers() -> tuple[list[str], list[str]]:
     grip = []
     edip = []
 
@@ -203,21 +196,39 @@ def load_configured_tickers() -> list[str]:
     if EDIP_ALLOCATION_PATH and EDIP_ALLOCATION_PATH.exists():
         edip = _read_edip_tickers(EDIP_ALLOCATION_PATH)
 
+    return grip, edip
+
+
+def add_always_run_tickers(tickers: list[str]) -> list[str]:
+    return _dedupe_preserve_order(tickers + ALWAYS_RUN_TICKERS)
+
+
+def load_configured_tickers() -> list[str]:
+    explicit_tickers = os.getenv("UNREALAI_TICKERS") or os.getenv("DATA_UPDATE_TICKERS")
+    if explicit_tickers:
+        return add_always_run_tickers(parse_ticker_list(explicit_tickers))
+
+    ticker_file = _env_path("UNREALAI_TICKER_FILE")
+    if ticker_file and ticker_file.exists():
+        return add_always_run_tickers(_read_ticker_file(ticker_file))
+
+    grip, edip = load_allocation_tickers()
+
     if grip or edip:
         mode = os.getenv("UNREALAI_TICKER_MODE", "xor").strip().lower()
         if mode in {"xor", "symmetric_difference", "symmetric-difference"}:
-            return sorted(set(grip) ^ set(edip))
+            return add_always_run_tickers(sorted(set(grip) ^ set(edip)))
         if mode in {"union", "all"}:
-            return _dedupe_preserve_order(grip + edip)
+            return add_always_run_tickers(_dedupe_preserve_order(grip + edip))
         if mode in {"intersection", "common"}:
-            return sorted(set(grip) & set(edip))
+            return add_always_run_tickers(sorted(set(grip) & set(edip)))
         raise ValueError(
             "UNREALAI_TICKER_MODE must be one of xor, union, or intersection; "
             f"got {mode!r}"
         )
 
     # Spark/Linux fallback: update whatever symbols already exist locally.
-    return sorted(set(_csv_symbols(TRAIN_DIR)) | set(_csv_symbols(TEST_DIR)))
+    return add_always_run_tickers(sorted(set(_csv_symbols(TRAIN_DIR)) | set(_csv_symbols(TEST_DIR))))
 
 
 TICKERS = load_configured_tickers()
@@ -1043,6 +1054,40 @@ def update_one_ticker(ticker: str):
     plt.close(ax2.figure)
 
 
+def cleanup_non_model_datasets() -> list[Path]:
+    grip, edip = load_allocation_tickers()
+    model_symbols = set(grip) | set(edip)
+
+    if not model_symbols:
+        print(
+            "Skipping train/test dataset cleanup because no GRIP or EDIP "
+            "allocation symbols were found."
+        )
+        return []
+
+    keep_symbols = model_symbols | set(ALWAYS_RUN_TICKERS)
+    removed_paths = []
+
+    for directory in (TRAIN_DIR, TEST_DIR):
+        if directory is None or not directory.exists():
+            continue
+
+        for path in directory.glob("*.csv"):
+            if path.stem.upper() in keep_symbols:
+                continue
+            path.unlink()
+            removed_paths.append(path)
+
+    if removed_paths:
+        print(f"Removed {len(removed_paths)} train/test CSVs not in GRIP or EDIP:")
+        for path in removed_paths:
+            print(f"  {path}")
+    else:
+        print("No train/test CSV cleanup needed.")
+
+    return removed_paths
+
+
 # =============================================================================
 # ENTRY POINT
 # =============================================================================
@@ -1067,7 +1112,14 @@ def parse_args():
         action="store_true",
         help="Print resolved paths and tickers without updating data.",
     )
-    return parser.parse_args()
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        launched_by_ipykernel = "ipykernel" in Path(sys.argv[0]).name.lower()
+        if launched_by_ipykernel:
+            print(f"Ignoring Jupyter kernel arguments: {' '.join(unknown)}")
+        else:
+            parser.error(f"unrecognized arguments: {' '.join(unknown)}")
+    return args
 
 
 def resolve_run_tickers(args) -> list[str]:
@@ -1081,7 +1133,7 @@ def resolve_run_tickers(args) -> list[str]:
     if args.limit is not None:
         tickers = tickers[: max(args.limit, 0)]
 
-    return tickers
+    return add_always_run_tickers(tickers)
 
 
 def print_config(tickers: list[str]):
@@ -1117,6 +1169,7 @@ def main():
 
     TRAIN_DIR.mkdir(parents=True, exist_ok=True)
     TEST_DIR.mkdir(parents=True, exist_ok=True)
+    cleanup_non_model_datasets()
 
     for ticker in tickers:
         update_one_ticker(ticker)
