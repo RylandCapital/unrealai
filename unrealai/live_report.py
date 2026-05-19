@@ -15,6 +15,12 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Optional
 
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("TF_DETERMINISTIC_OPS", "0")
+os.environ.setdefault("PYTHONHASHSEED", "42")
+os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
+os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -34,54 +40,82 @@ try:
 except ModuleNotFoundError:
     from unrealai.utils.feature_compat import BACKFILLABLE_FEATURE_COLS, ensure_backfilled_feature_columns
 
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
-os.environ.setdefault("PYTHONHASHSEED", "42")
-
 load_dotenv()
+APP_DIR = Path(__file__).resolve().parent
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or str(value).strip() == "":
+        return int(default)
+    return int(value)
+
+
+def env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or str(value).strip() == "":
+        return float(default)
+    return float(value)
 
 
 class CFG:
 
     # Report window
-    REPORT_START_DATE = "2025-02-27" #300
-    # REPORT_START_DATE = "2026-02-25" #50
+    # Prefer REPORT_DAYS_BACK so the report stays inside the test CSV window.
+    # Example: REPORT_DAYS_BACK=180 uses the last 180 rows of each symbol's test file.
+    # REPORT_START_DATE remains available as an explicit override when set.
+    REPORT_DAYS_BACK = env_int("REPORT_DAYS_BACK", 180)
+    REPORT_START_DATE = (os.getenv("REPORT_START_DATE", "").strip() or None)
+    REPORT_USE_COMMON_START_DATE = env_bool("REPORT_USE_COMMON_START_DATE", True)
 
     # Core
     SEED = 42
     WINDOW_SIZE = 21
     INITIAL_CASH = 100_000_000
+    AGGREGATE_INITIAL_CASH = env_float("AGGREGATE_INITIAL_CASH", 1_000_000.0)
 
     # Keep these aligned with the training script
-    COOLDOWN_DAYS = 5
-    MIN_HOLD_DAYS = 5
-    COOLDOWN_DAYS_AFTER_PROFITABLE_CLOSE = 0
-    COOLDOWN_DAYS_AFTER_LOSING_CLOSE = 5
-    COOLDOWN_DAYS_AFTER_STOP_EXIT = 5
+    COOLDOWN_DAYS = 3
+    MIN_HOLD_DAYS = 10
+    COOLDOWN_DAYS_AFTER_PROFITABLE_CLOSE = 1
+    COOLDOWN_DAYS_AFTER_LOSING_CLOSE = 3
+    COOLDOWN_DAYS_AFTER_STOP_EXIT = 1
     COOLDOWN_DAYS_AFTER_TAKE_PROFIT_EXIT = 0
     SLIPPAGE_RATE = 0.0000
     STOP_LOSS_TEST = .15
     TAKE_PROFIT_TEST = 1000.0
 
     # Optional LLM overwatch, mirroring the test-set review flow in main_w_llm.py
-    OVERWATCH_ENABLED = False
-    OVERWATCH_EVERY_N_STEPS = 5
+    OVERWATCH_ENABLED = env_bool("OVERWATCH_ENABLED_LIVE", False)
+    OVERWATCH_EVERY_N_STEPS = env_int("OVERWATCH_EVERY_N_STEPS", 5)
     OVERWATCH_REASONING_EFFORT = "high"
-    MODEL = "gpt-5-mini"
+    MODEL = os.getenv("OVERWATCH_MODEL", "gpt-5-mini")
     OVERWATCH_ALLOW_CONSTRAINT_OVERRIDE = True
     SAVE_OVERWATCH_CHARTS = True
-    OVERWATCH_CHARTS_DIR = r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\overwatch_charts\live_report"
-    NUM_WORKERS = 12
+    OVERWATCH_CHARTS_DIR = str(APP_DIR / "overwatch_charts" / "live_report")
+    NUM_WORKERS = env_int("LIVE_REPORT_NUM_WORKERS", 1)
     CONSOLE_PROGRESS = True
-    SIGNAL_PROGRESS_EVERY_N_STEPS = 10
+    SIGNAL_PROGRESS_EVERY_N_STEPS = env_int("SIGNAL_PROGRESS_EVERY_N_STEPS", 25)
     OVERWATCH_VERBOSE_PROGRESS = True
 
     # Paths
-    MODEL_DIR = r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\models"
-    DATA_DIR = r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\testdata"
-    OUTPUT_DIR = r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\live_reports"
-    DASHBOARD_DIR = r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\dashboard_data"
-    REPORT_VWAP_MODULE_PATH = r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\utils\overwatch_chart.py"
+    MODEL_DIR = os.getenv("MODEL_DIR", str(APP_DIR / "models"))
+    DATA_DIR = os.getenv("DATA_DIR", str(APP_DIR / "testdata"))
+    OUTPUT_DIR = os.getenv("LIVE_REPORT_OUTPUT_DIR", str(APP_DIR / "live_reports"))
+    DASHBOARD_DIR = os.getenv("DASHBOARD_DIR", str(APP_DIR / "dashboard_data"))
+    REPORT_VWAP_MODULE_PATH = os.getenv("REPORT_VWAP_MODULE_PATH", str(APP_DIR / "utils" / "overwatch_chart.py"))
+    AGGREGATE_BENCHMARK_SYMBOLS = [
+        s.strip().upper()
+        for s in os.getenv("AGGREGATE_BENCHMARK_SYMBOLS", "EQAL,RSP,QQQE").split(",")
+        if s.strip()
+    ]
 
 
     # None = auto-discover from DATA_DIR
@@ -770,7 +804,10 @@ class TradingEnv:
         force_close = bool(getattr(self, "overwatch_force_close_once", False))
         self.overwatch_force_open_once = False
         self.overwatch_force_close_once = False
+        pre_position = int(self.position)
         close_reason = ""
+        opened_trade = False
+        closed_trade = False
 
         prev_equity = float(self.equity)
         prev_bh_equity = float(self.bh_equity)
@@ -780,11 +817,21 @@ class TradingEnv:
             self.last_price_idx = int(self.current_step)
             if self.position != 0:
                 self._do_close(price)
+                closed_trade = True
+                close_reason = "terminal"
             self._mark_to_market(price)
             self._update_benchmark(price)
             reward, blew_up = self._log_excess_return_reward(prev_equity, prev_bh_equity)
             self.done = True
-            info = {"bankrupt": True} if blew_up else {}
+            info = {
+                "bankrupt": bool(blew_up),
+                "opened_trade": False,
+                "closed_trade": bool(closed_trade),
+                "close_reason": close_reason,
+                "force_open": bool(force_open),
+                "force_close": bool(force_close),
+                "pre_position": int(pre_position),
+            }
             return self._get_obs(), float(reward), True, info
 
         price = float(self.prices[self.current_step])
@@ -794,6 +841,7 @@ class TradingEnv:
             self.close_hits += 1
             close_pct = self._do_close(price)
             close_reason = "discretionary"
+            closed_trade = True
             self.cooldown_remaining = self._cooldown_days_after_exit(close_pct, close_reason)
 
         if self.position != 0:
@@ -801,10 +849,12 @@ class TradingEnv:
             if pct_move <= -self.stop_loss or pct_move >= self.take_profit:
                 close_reason = "stop_loss" if pct_move <= -self.stop_loss else "take_profit"
                 close_pct = self._do_close(price)
+                closed_trade = True
                 self.cooldown_remaining = self._cooldown_days_after_exit(close_pct, close_reason)
 
         if self.position == 0 and (self.cooldown_remaining == 0 or force_open):
             if action == ACTION_LONG:
+                opened_trade = True
                 trade_value = float(self.cash)
                 if trade_value > 0 and price > 0:
                     slip_cost = trade_value * self.slippage_rate
@@ -827,7 +877,15 @@ class TradingEnv:
         self.current_step += 1
         if self.current_step >= self.n_steps:
             self.done = True
-        info = {"bankrupt": True} if blew_up else {}
+        info = {
+            "bankrupt": bool(blew_up),
+            "opened_trade": bool(opened_trade),
+            "closed_trade": bool(closed_trade),
+            "close_reason": close_reason,
+            "force_open": bool(force_open),
+            "force_close": bool(force_close),
+            "pre_position": int(pre_position),
+        }
         if blew_up:
             self.done = True
         return self._get_obs(), float(reward), self.done, info
@@ -1038,12 +1096,27 @@ def build_env(df, *, window_size: int, initial_cash: float, raw_feature_df=None)
     )
 
 
-def get_report_start_idx(df: pd.DataFrame, report_start_date: str) -> int:
-    dt = pd.Timestamp(report_start_date)
-    matches = np.where(pd.to_datetime(df["Date"]).to_numpy() >= np.datetime64(dt))[0]
-    if len(matches) == 0:
-        raise ValueError(f"No rows on/after REPORT_START_DATE={report_start_date}")
-    return int(matches[0])
+def get_report_start_idx(
+    df: pd.DataFrame,
+    report_start_date: str | None = None,
+    report_days_back: int | None = None,
+) -> int:
+    min_idx = int(getattr(CFG, "WINDOW_SIZE", 0) or 0)
+    if len(df) <= min_idx:
+        raise ValueError(f"Dataframe too short for WINDOW_SIZE={min_idx}")
+
+    if report_start_date:
+        dt = pd.Timestamp(report_start_date)
+        matches = np.where(pd.to_datetime(df["Date"]).to_numpy() >= np.datetime64(dt))[0]
+        if len(matches) == 0:
+            raise ValueError(f"No rows on/after REPORT_START_DATE={report_start_date}")
+        return max(int(matches[0]), min_idx)
+
+    days_back = int(report_days_back if report_days_back is not None else getattr(CFG, "REPORT_DAYS_BACK", 0) or 0)
+    if days_back <= 0:
+        return min_idx
+    start_idx = max(0, int(len(df)) - days_back)
+    return max(start_idx, min_idx)
 
 
 def generate_signal_log(agent, df, *, window_size=20, initial_cash=100_000, start_idx=0, symbol="", raw_feature_df=None):
@@ -1074,6 +1147,9 @@ def generate_signal_log(agent, df, *, window_size=20, initial_cash=100_000, star
     progress_every = max(1, int(getattr(CFG, "SIGNAL_PROGRESS_EVERY_N_STEPS", 25)))
 
     while True:
+        position_before = int(env.position)
+        cooldown_before = int(getattr(env, "cooldown_remaining", 0))
+
         if CFG.OVERWATCH_ENABLED:
             action, q_vals, q_masked = agent.act(state, env=env, symbol=symbol, use_overwatch=True)
         else:
@@ -1081,16 +1157,31 @@ def generate_signal_log(agent, df, *, window_size=20, initial_cash=100_000, star
         last_q_vals = q_vals
         last_q_masked = q_masked
 
-        next_state, _, done, _ = env.step(action)
+        force_open = bool(getattr(env, "overwatch_force_open_once", False))
+        force_close = bool(getattr(env, "overwatch_force_close_once", False))
+        next_state, _, done, info = env.step(action)
         idx = int(env.last_price_idx) if env.last_price_idx is not None else int(max(0, env.current_step - 1))
         dt = pd.Timestamp(env.dates[idx])
+        closed_trade = bool(info.get("closed_trade", False))
+        close_reason = str(info.get("close_reason", "") or "")
+        replay_action = ACTION_CLOSE if closed_trade else int(action)
 
         signal_rows.append(
             {
                 "step": idx,
                 "date": dt,
                 "action": int(action),
+                "replay_action": int(replay_action),
                 "action_name": action_to_name(int(action)),
+                "position_before": int(position_before),
+                "position_after": int(env.position),
+                "cooldown_before": int(cooldown_before),
+                "cooldown_after": int(getattr(env, "cooldown_remaining", 0)),
+                "opened_trade": bool(info.get("opened_trade", False)),
+                "closed_trade": bool(closed_trade),
+                "close_reason": close_reason,
+                "force_open": bool(force_open or info.get("force_open", False)),
+                "force_close": bool(force_close or info.get("force_close", False)),
                 "q_hold": float(q_vals[ACTION_HOLD]),
                 "q_long": float(q_vals[ACTION_LONG]),
                 "q_close": float(q_vals[ACTION_CLOSE]),
@@ -1147,6 +1238,84 @@ def buy_hold_curve_from_signals(df, first_step: int, last_step: int, initial_cas
     return dates, bh
 
 
+def _read_benchmark_price_series(symbol: str) -> Optional[pd.DataFrame]:
+    csv_path = Path(CFG.DATA_DIR) / f"{symbol}.csv"
+    if not csv_path.exists():
+        print(f"[warn] aggregate benchmark file not found: {csv_path}")
+        return None
+
+    header = pd.read_csv(csv_path, nrows=0)
+    price_col = next(
+        (c for c in ["adjusted_close", "Adj Close", "adj_close", "Close", "close"] if c in header.columns),
+        None,
+    )
+    if price_col is None:
+        print(f"[warn] aggregate benchmark {symbol} has no usable close column: {csv_path}")
+        return None
+
+    df = pd.read_csv(csv_path, usecols=["Date", price_col], parse_dates=["Date"])
+    df = df.rename(columns={price_col: symbol})
+    df[symbol] = pd.to_numeric(df[symbol], errors="coerce")
+    df = df.dropna(subset=["Date", symbol]).sort_values("Date").reset_index(drop=True)
+    if df.empty:
+        print(f"[warn] aggregate benchmark {symbol} has no usable prices: {csv_path}")
+        return None
+    return df
+
+
+def apply_aggregate_benchmark_basket(agg_curve: pd.DataFrame) -> pd.DataFrame:
+    out = agg_curve.copy()
+    if out.empty:
+        return out
+
+    benchmark_symbols = list(getattr(CFG, "AGGREGATE_BENCHMARK_SYMBOLS", []))
+    if not benchmark_symbols:
+        return out
+
+    bench = pd.DataFrame({"Date": pd.to_datetime(out["Date"])})
+    loaded_symbols = []
+    for symbol in benchmark_symbols:
+        price_df = _read_benchmark_price_series(symbol)
+        if price_df is None:
+            continue
+        bench = bench.merge(price_df, on="Date", how="left")
+        loaded_symbols.append(symbol)
+
+    if not loaded_symbols:
+        raise RuntimeError(
+            "No aggregate benchmark series loaded. "
+            "Set AGGREGATE_BENCHMARK_SYMBOLS to CSVs available in DATA_DIR."
+        )
+
+    norm_cols = []
+    for symbol in loaded_symbols:
+        prices = pd.to_numeric(bench[symbol], errors="coerce").ffill()
+        first_valid = prices.dropna()
+        if first_valid.empty or float(first_valid.iloc[0]) <= 0:
+            print(f"[warn] aggregate benchmark {symbol} has no valid start price in the report window")
+            continue
+        norm_col = f"benchmark_{symbol}_index"
+        bench[norm_col] = prices / float(first_valid.iloc[0])
+        norm_cols.append(norm_col)
+
+    if not norm_cols:
+        raise RuntimeError("Aggregate benchmark series could not be normalized.")
+
+    benchmark_index = bench[norm_cols].mean(axis=1, skipna=True)
+    capital_base = float(getattr(CFG, "AGGREGATE_INITIAL_CASH", CFG.INITIAL_CASH))
+
+    for symbol in loaded_symbols:
+        norm_col = f"benchmark_{symbol}_index"
+        if norm_col in bench.columns:
+            out[f"benchmark_{symbol}"] = capital_base * bench[norm_col]
+    out["benchmark_index"] = benchmark_index
+    out["benchmark_symbols"] = ",".join(loaded_symbols)
+    out["buy_hold"] = capital_base * benchmark_index
+    out["benchmark_return_pct"] = (benchmark_index - 1.0) * 100.0
+    out["alpha_pct"] = out["portfolio_return_pct"] - out["benchmark_return_pct"]
+    return out
+
+
 def replay_signals_with_fill_mode(
     df,
     signal_rows,
@@ -1156,6 +1325,8 @@ def replay_signals_with_fill_mode(
     slippage_rate: float,
     cooldown_days: int,
     min_hold_days: int,
+    stop_loss: float | None = None,
+    take_profit: float | None = None,
     profitable_close_cooldown_days: int | None = None,
     losing_close_cooldown_days: int | None = None,
     force_close_end: bool,
@@ -1185,7 +1356,7 @@ def replay_signals_with_fill_mode(
 
     first_step = int(signal_rows[0]["step"])
     last_step = int(signal_rows[-1]["step"])
-    action_by_step = {int(r["step"]): int(r["action"]) for r in signal_rows}
+    signal_by_step = {int(r["step"]): dict(r) for r in signal_rows}
 
     closes = df["adjusted_close"].to_numpy(dtype=np.float64)
     dates_all = pd.to_datetime(df["Date"]).tolist()
@@ -1211,17 +1382,19 @@ def replay_signals_with_fill_mode(
     out_shares = []
     out_entry_price = []
 
-    def _can_open():
-        return position == 0 and cooldown_remaining == 0
+    def _can_open(force: bool = False):
+        return position == 0 and (cooldown_remaining == 0 or bool(force))
 
     def _bars_held(asof_idx: int) -> int:
         if position != 1 or entry_step is None:
             return 0
         return max(0, int(asof_idx) - int(entry_step))
 
-    def _can_close(asof_idx: int):
+    def _can_close(asof_idx: int, force: bool = False):
         if position != 1:
             return False
+        if bool(force):
+            return True
         if int(min_hold_days) <= 0:
             return True
         return _bars_held(asof_idx) >= int(min_hold_days)
@@ -1270,18 +1443,28 @@ def replay_signals_with_fill_mode(
         signal_close = float(closes[signal_idx])
         return float(fill_px) < signal_close
 
+    def _stop_or_take_reason(idx: int) -> str:
+        if position != 1 or entry_price <= 0:
+            return ""
+        pct_move = (float(closes[idx]) - float(entry_price)) / (float(entry_price) + 1e-12)
+        if stop_loss is not None and pct_move <= -float(stop_loss):
+            return "stop_loss"
+        if take_profit is not None and pct_move >= float(take_profit):
+            return "take_profit"
+        return ""
+
     for idx in range(first_step, last_step + 1):
         if pending_order is not None and int(pending_order["fill_idx"]) == idx:
             fill_px = get_fill_price(df, idx, fill_mode)
             if pending_order["type"] == "open_long":
                 signal_idx = int(pending_order.get("signal_idx", idx - 1))
-                if _can_open():
+                if _can_open(force=bool(pending_order.get("force", False))):
                     if _entry_filter_passes(signal_idx, idx, fill_px):
                         _open_long(idx, fill_px)
                     else:
                         skipped_entry_filter_count += 1
             elif pending_order["type"] == "close_long":
-                if _can_close(idx):
+                if _can_close(idx, force=bool(pending_order.get("force", False))):
                     _close_long(idx, fill_px)
             pending_order = None
 
@@ -1299,13 +1482,22 @@ def replay_signals_with_fill_mode(
         out_shares.append(float(shares))
         out_entry_price.append(float(entry_price) if position == 1 else np.nan)
 
-        action = int(action_by_step.get(idx, ACTION_HOLD))
+        signal = signal_by_step.get(idx, {})
+        action = int(signal.get("replay_action", signal.get("action", ACTION_HOLD)))
+        close_reason = str(signal.get("close_reason", "") or "")
+        force_open = bool(signal.get("force_open", False))
+        force_close = bool(signal.get("force_close", False)) or close_reason in {"stop_loss", "take_profit", "terminal"}
+
+        auto_reason = _stop_or_take_reason(idx)
+        if auto_reason:
+            action = ACTION_CLOSE
+            force_close = True
 
         if fill_mode == CFG.FILL_MODE_CLOSE_T:
             fill_px = get_fill_price(df, idx, fill_mode)
-            if action == ACTION_LONG and _can_open():
+            if action == ACTION_LONG and _can_open(force=force_open):
                 _open_long(idx, fill_px)
-            elif action == ACTION_CLOSE and _can_close(idx):
+            elif action == ACTION_CLOSE and _can_close(idx, force=force_close):
                 _close_long(idx, fill_px)
 
             close_px = float(closes[idx])
@@ -1318,14 +1510,24 @@ def replay_signals_with_fill_mode(
             out_entry_price[-1] = float(entry_price) if position == 1 else np.nan
         else:
             if idx < last_step:
-                if action == ACTION_LONG and _can_open():
-                    pending_order = {"type": "open_long", "fill_idx": idx + 1, "signal_idx": idx}
-                elif action == ACTION_CLOSE and _can_close(idx + 1):
-                    pending_order = {"type": "close_long", "fill_idx": idx + 1, "signal_idx": idx}
+                if action == ACTION_LONG and _can_open(force=force_open):
+                    pending_order = {
+                        "type": "open_long",
+                        "fill_idx": idx + 1,
+                        "signal_idx": idx,
+                        "force": bool(force_open),
+                    }
+                elif action == ACTION_CLOSE and _can_close(idx + 1, force=force_close):
+                    pending_order = {
+                        "type": "close_long",
+                        "fill_idx": idx + 1,
+                        "signal_idx": idx,
+                        "force": bool(force_close),
+                    }
             else:
-                if action == ACTION_LONG and _can_open():
+                if action == ACTION_LONG and _can_open(force=force_open):
                     dropped_pending_orders += 1
-                elif action == ACTION_CLOSE and _can_close(idx + 1) and not force_close_end:
+                elif action == ACTION_CLOSE and _can_close(idx + 1, force=force_close) and not force_close_end:
                     dropped_pending_orders += 1
 
     if force_close_end and position == 1:
@@ -1633,6 +1835,7 @@ def build_symbol_summary_row(
     trade_log_df: pd.DataFrame,
     agent_state: dict,
     signal_pack: dict,
+    report_start_date: pd.Timestamp,
 ) -> dict:
     last_signal = signals[-1]
     last_step = int(signals[-1]["step"])
@@ -1647,7 +1850,7 @@ def build_symbol_summary_row(
     return {
         "symbol": symbol,
         "last_bar_date": pd.Timestamp(raw_df["Date"].iloc[last_step]),
-        "report_start_date": pd.Timestamp(CFG.REPORT_START_DATE),
+        "report_start_date": pd.Timestamp(report_start_date),
         "primary_fill_mode": CFG.PRIMARY_REPORT_FILL_MODE,
         "stance": "LONG" if int(primary_live["final_position"]) == 1 else "FLAT",
         "position": int(primary_live["final_position"]),
@@ -1742,8 +1945,10 @@ def compute_symbol_metrics(symbol_timeseries: pd.DataFrame, summary_df: pd.DataF
 
 def aggregate_curve_tables(symbol_curve_tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
     merged = None
+    aggregate_cols = ["Date", "buy_hold", "primary_live", "primary_position"] + list(CFG.ALL_FILL_MODES)
     for symbol, df_curve in symbol_curve_tables.items():
-        temp = df_curve.copy()
+        keep_cols = [c for c in aggregate_cols if c in df_curve.columns]
+        temp = df_curve.loc[:, keep_cols].copy()
         rename_map = {
             "buy_hold": f"buy_hold__{symbol}",
             "primary_live": f"primary_live__{symbol}",
@@ -1774,11 +1979,22 @@ def aggregate_curve_tables(symbol_curve_tables: dict[str, pd.DataFrame]) -> pd.D
         out[mode] = merged[cols].sum(axis=1, skipna=True)
 
     reporting = pd.to_numeric(out["symbols_reporting"], errors="coerce").replace(0, np.nan)
-    capital_base = float(CFG.INITIAL_CASH) * reporting
-    out["portfolio_return_pct"] = (out["primary_live"] / capital_base - 1.0) * 100.0
-    out["benchmark_return_pct"] = (out["buy_hold"] / capital_base - 1.0) * 100.0
+    aggregate_capital_base = float(getattr(CFG, "AGGREGATE_INITIAL_CASH", CFG.INITIAL_CASH))
+    source_capital_base = float(CFG.INITIAL_CASH) * reporting
+    scale = aggregate_capital_base / source_capital_base
+
+    equity_cols = ["buy_hold", "primary_live"] + list(CFG.ALL_FILL_MODES)
+    for col in equity_cols:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce") * scale
+
+    out["aggregate_initial_cash"] = aggregate_capital_base
+    out["model_symbol_allocation"] = aggregate_capital_base / reporting
+    out["portfolio_return_pct"] = (out["primary_live"] / aggregate_capital_base - 1.0) * 100.0
+    out["benchmark_return_pct"] = (out["buy_hold"] / aggregate_capital_base - 1.0) * 100.0
     out["alpha_pct"] = out["portfolio_return_pct"] - out["benchmark_return_pct"]
     out["drawdown_pct"] = compute_drawdown_pct_series(out["primary_live"])
+    out = apply_aggregate_benchmark_basket(out)
 
     return out
 
@@ -1813,7 +2029,12 @@ def compute_trade_stats(trade_log: pd.DataFrame) -> dict[str, float]:
     }
 
 
-def build_dashboard_summary(symbol_metrics: pd.DataFrame, aggregate_timeseries: pd.DataFrame, trade_log: pd.DataFrame) -> DashboardSummary:
+def build_dashboard_summary(
+    summary_df: pd.DataFrame,
+    symbol_metrics: pd.DataFrame,
+    aggregate_timeseries: pd.DataFrame,
+    trade_log: pd.DataFrame,
+) -> DashboardSummary:
     trade_stats = compute_trade_stats(trade_log)
 
     if aggregate_timeseries.empty:
@@ -1836,10 +2057,15 @@ def build_dashboard_summary(symbol_metrics: pd.DataFrame, aggregate_timeseries: 
     exposure_pct = (open_positions / total_symbols * 100.0) if total_symbols else 0.0
     unrealized_pnl = float(pd.to_numeric(symbol_metrics.get("unrealized_pnl", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum())
     realized_pnl = float(trade_stats["realized_pnl"])
+    if "report_start_date" in summary_df.columns and not summary_df.empty:
+        starts = pd.to_datetime(summary_df["report_start_date"], errors="coerce").dropna()
+        report_start_date = starts.min().strftime("%Y-%m-%d") if not starts.empty else ""
+    else:
+        report_start_date = str(CFG.REPORT_START_DATE or f"last_{int(CFG.REPORT_DAYS_BACK)}_rows")
 
     return DashboardSummary(
         as_of=as_of,
-        report_start_date=str(CFG.REPORT_START_DATE),
+        report_start_date=report_start_date,
         primary_fill_mode=CFG.PRIMARY_REPORT_FILL_MODE,
         total_symbols=total_symbols,
         open_positions=open_positions,
@@ -1868,7 +2094,7 @@ def save_dashboard_outputs(
 ) -> None:
     _ensure_dir(output_dir)
 
-    dashboard_summary = build_dashboard_summary(symbol_metrics_df, aggregate_timeseries_df, trade_log_df)
+    dashboard_summary = build_dashboard_summary(summary_df, symbol_metrics_df, aggregate_timeseries_df, trade_log_df)
 
     with open(output_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(asdict(dashboard_summary), f, indent=2, default=str)
@@ -2011,7 +2237,10 @@ def make_symbol_figure(symbol: str, curve_df: pd.DataFrame, raw_df: pd.DataFrame
 
 def make_aggregate_figure(agg_curve: pd.DataFrame) -> go.Figure:
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.72, 0.28])
-    fig.add_trace(go.Scatter(x=agg_curve["Date"], y=agg_curve["buy_hold"], mode="lines", name="Aggregate Buy & Hold"), row=1, col=1)
+    benchmark_name = "Aggregate Benchmark"
+    if "benchmark_symbols" in agg_curve.columns and not agg_curve["benchmark_symbols"].dropna().empty:
+        benchmark_name = f"Aggregate Benchmark ({agg_curve['benchmark_symbols'].dropna().iloc[-1]})"
+    fig.add_trace(go.Scatter(x=agg_curve["Date"], y=agg_curve["buy_hold"], mode="lines", name=benchmark_name), row=1, col=1)
     fig.add_trace(go.Scatter(x=agg_curve["Date"], y=agg_curve["primary_live"], mode="lines", name=f"Aggregate {get_fill_mode_display_name(CFG.PRIMARY_REPORT_FILL_MODE)} Live", line=dict(width=4)), row=1, col=1)
     for mode in CFG.ALL_FILL_MODES:
         fig.add_trace(
@@ -2046,7 +2275,50 @@ def save_plotly_figure(fig: go.Figure, output_path: Path) -> None:
 
 
 def discover_symbols(data_dir: str):
-    return sorted([p.stem for p in Path(data_dir).glob("*.csv")])
+    symbols = sorted([p.stem.upper() for p in Path(data_dir).glob("*.csv")])
+    benchmark_symbols = set(getattr(CFG, "AGGREGATE_BENCHMARK_SYMBOLS", []))
+    runnable = []
+    skipped_no_checkpoint = []
+    for symbol in symbols:
+        ckpt = get_checkpoint_paths(CFG.MODEL_DIR, symbol)
+        if os.path.exists(ckpt["policy"]) and os.path.exists(ckpt["scaler"]):
+            runnable.append(symbol)
+        elif symbol in benchmark_symbols:
+            continue
+        else:
+            skipped_no_checkpoint.append(symbol)
+
+    if skipped_no_checkpoint:
+        print(
+            "[warn] skipping symbols without policy/scaler checkpoints: "
+            + ", ".join(skipped_no_checkpoint)
+        )
+    return runnable
+
+
+def compute_common_report_start_date(symbols: list[str]) -> Optional[pd.Timestamp]:
+    if CFG.REPORT_START_DATE:
+        return pd.Timestamp(CFG.REPORT_START_DATE)
+    if not bool(getattr(CFG, "REPORT_USE_COMMON_START_DATE", True)):
+        return None
+
+    starts = []
+    for symbol in symbols:
+        csv_path = Path(CFG.DATA_DIR) / f"{symbol}.csv"
+        if not csv_path.exists():
+            continue
+        date_df = pd.read_csv(csv_path, usecols=["Date"], parse_dates=["Date"])
+        date_df = date_df.sort_values("Date").reset_index(drop=True)
+        start_idx = get_report_start_idx(
+            date_df,
+            report_start_date=None,
+            report_days_back=CFG.REPORT_DAYS_BACK,
+        )
+        starts.append(pd.Timestamp(date_df["Date"].iloc[start_idx]))
+
+    if not starts:
+        return None
+    return max(starts)
 
 
 def validate_scaler_feature_order(scaler: ZScoreScaler):
@@ -2075,10 +2347,15 @@ def run_for_symbol(symbol: str):
     validate_scaler_feature_order(scaler)
     df = scaler.transform(raw_df)
 
-    report_start_idx = get_report_start_idx(df, CFG.REPORT_START_DATE)
+    report_start_idx = get_report_start_idx(
+        df,
+        report_start_date=CFG.REPORT_START_DATE,
+        report_days_back=CFG.REPORT_DAYS_BACK,
+    )
+    report_start_date = pd.Timestamp(df["Date"].iloc[report_start_idx])
     log_progress(
-        f"{symbol}: using report start {pd.Timestamp(df['Date'].iloc[report_start_idx]).strftime('%Y-%m-%d')} "
-        f"(index={report_start_idx})"
+        f"{symbol}: using report start {report_start_date.strftime('%Y-%m-%d')} "
+        f"(index={report_start_idx}, days_back={int(CFG.REPORT_DAYS_BACK) if CFG.REPORT_START_DATE is None else 'date override'})"
     )
     model = load_keras_model(ckpt["policy"])
     log_progress(f"{symbol}: loaded policy model from {ckpt['policy']}")
@@ -2115,6 +2392,8 @@ def run_for_symbol(symbol: str):
             slippage_rate=float(CFG.SLIPPAGE_RATE),
             cooldown_days=int(CFG.COOLDOWN_DAYS),
             min_hold_days=int(CFG.MIN_HOLD_DAYS),
+            stop_loss=float(CFG.STOP_LOSS_TEST),
+            take_profit=float(CFG.TAKE_PROFIT_TEST),
             profitable_close_cooldown_days=int(CFG.COOLDOWN_DAYS_AFTER_PROFITABLE_CLOSE),
             losing_close_cooldown_days=int(CFG.COOLDOWN_DAYS_AFTER_LOSING_CLOSE),
             force_close_end=True,
@@ -2127,6 +2406,8 @@ def run_for_symbol(symbol: str):
             slippage_rate=float(CFG.SLIPPAGE_RATE),
             cooldown_days=int(CFG.COOLDOWN_DAYS),
             min_hold_days=int(CFG.MIN_HOLD_DAYS),
+            stop_loss=float(CFG.STOP_LOSS_TEST),
+            take_profit=float(CFG.TAKE_PROFIT_TEST),
             profitable_close_cooldown_days=int(CFG.COOLDOWN_DAYS_AFTER_PROFITABLE_CLOSE),
             losing_close_cooldown_days=int(CFG.COOLDOWN_DAYS_AFTER_LOSING_CLOSE),
             force_close_end=False,
@@ -2181,6 +2462,7 @@ def run_for_symbol(symbol: str):
         trade_log_df=trade_log_df,
         agent_state=agent_state,
         signal_pack=signal_pack,
+        report_start_date=report_start_date,
     )
 
     log_progress(
@@ -2276,10 +2558,22 @@ def main():
     symbols = CFG.SYMBOLS if CFG.SYMBOLS else discover_symbols(CFG.DATA_DIR)
     if not symbols:
         raise RuntimeError(f"No symbols found in DATA_DIR: {CFG.DATA_DIR}")
+
+    common_report_start_date = compute_common_report_start_date(symbols)
+    if common_report_start_date is not None:
+        CFG.REPORT_START_DATE = common_report_start_date.strftime("%Y-%m-%d")
+        os.environ["REPORT_START_DATE"] = CFG.REPORT_START_DATE
+        log_progress(
+            f"Using common report start date {CFG.REPORT_START_DATE} "
+            f"from REPORT_DAYS_BACK={int(CFG.REPORT_DAYS_BACK)} across {len(symbols)} symbols"
+        )
+
     worker_count = max(1, min(int(getattr(CFG, "NUM_WORKERS", 12)), len(symbols)))
     log_progress(
         f"Starting live report for {len(symbols)} symbols "
-        f"(overwatch={'ON' if CFG.OVERWATCH_ENABLED else 'OFF'}, report_start={CFG.REPORT_START_DATE}, workers={worker_count})"
+        f"(overwatch={'ON' if CFG.OVERWATCH_ENABLED else 'OFF'}, "
+        f"report_window={'start_date=' + str(CFG.REPORT_START_DATE) if CFG.REPORT_START_DATE else 'days_back=' + str(CFG.REPORT_DAYS_BACK)}, "
+        f"workers={worker_count})"
     )
 
     summary_rows = []
@@ -2388,4 +2682,3 @@ if __name__ == "__main__":
     multiprocessing.set_start_method("spawn", force=True)
     multiprocessing.freeze_support()
     main()
-

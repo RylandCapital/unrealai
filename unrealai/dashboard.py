@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -11,8 +12,20 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 APP_TITLE = "cwpAI"
-DEFAULT_DATA_DIR = Path(r"P:\10_CWP Trade Department\Ryland\unrealai\unrealai\dashboard_data")
+APP_DIR = Path(__file__).resolve().parent
+DEFAULT_DATA_DIR = APP_DIR / "dashboard_data"
 FALLBACK_DATA_DIR = Path("dashboard_data")
+DEFAULT_ALLOCATION_DIR = APP_DIR / "allocations"
+
+
+def allocation_path(env_name: str, local_filename: str, windows_path: str) -> Path:
+    env_value = os.getenv(env_name, "").strip()
+    if env_value:
+        return Path(env_value)
+    local_path = DEFAULT_ALLOCATION_DIR / local_filename
+    if local_path.exists():
+        return local_path
+    return Path(windows_path)
 
 FILL_LABELS = {
     "close_t": "Close T0",
@@ -23,12 +36,20 @@ FILL_LABELS = {
 
 MODEL_CONFIG = {
     "GRIP": {
-        "path": Path(r"P:\10_CWP Trade Department\_Matrix_\code_outputs\grip_momo\grip_allocation.xlsx"),
+        "path": allocation_path(
+            "GRIP_ALLOCATION_PATH",
+            "grip_allocation.xlsx",
+            r"P:\10_CWP Trade Department\_Matrix_\code_outputs\grip_momo\grip_allocation.xlsx",
+        ),
         "header": 1,
         "ticker_col": "Ticker",
     },
     "EDIP": {
-        "path": Path(r"P:\10_CWP Trade Department\Smitty\DSIP allocation.xlsx"),
+        "path": allocation_path(
+            "EDIP_ALLOCATION_PATH",
+            "DSIP allocation.xlsx",
+            r"P:\10_CWP Trade Department\Smitty\DSIP allocation.xlsx",
+        ),
         "header": 0,
         "ticker_col": "Unnamed: 1",
     },
@@ -409,7 +430,13 @@ def load_model_symbols(model_name: str) -> list[str]:
     cfg = MODEL_CONFIG[model_name]
     path = cfg["path"]
     if not path.exists():
-        raise FileNotFoundError(f"Missing model allocation file: {path}")
+        env_name = f"{model_name}_ALLOCATION_PATH"
+        local_path = DEFAULT_ALLOCATION_DIR / ("grip_allocation.xlsx" if model_name == "GRIP" else "DSIP allocation.xlsx")
+        raise FileNotFoundError(
+            f"Missing model allocation file: {path}. "
+            f"This Streamlit app is running on {Path.cwd()}, so Windows drive paths like P:\\ are not visible unless mounted. "
+            f"Put a copy at {local_path} or set {env_name} to a Spark-accessible path."
+        )
 
     df = pd.read_excel(path, header=cfg["header"])
     ticker_col = cfg["ticker_col"]
@@ -688,7 +715,10 @@ def make_portfolio_chart(agg: pd.DataFrame, primary_fill_mode: str) -> go.Figure
     bench_col = maybe_col(agg, ["buy_hold", "benchmark_equity", "benchmark"])
 
     if bench_col:
-        fig.add_trace(go.Scatter(x=x, y=to_return_pct(agg[bench_col]), mode="lines", name="Benchmark Return", line=dict(width=2.4)))
+        benchmark_name = "Benchmark Return"
+        if "benchmark_symbols" in agg.columns and not agg["benchmark_symbols"].dropna().empty:
+            benchmark_name = f"Benchmark Return ({agg['benchmark_symbols'].dropna().iloc[-1]})"
+        fig.add_trace(go.Scatter(x=x, y=to_return_pct(agg[bench_col]), mode="lines", name=benchmark_name, line=dict(width=2.4)))
 
     for fill_mode in FILL_LABELS:
         col = get_fill_series_col(agg, fill_mode, prefer_primary_alias=(fill_mode == primary_fill_mode))
