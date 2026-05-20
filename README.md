@@ -46,3 +46,5 @@ From the main repo, you can publish this folder to GitHub with:
 ```
 
 That updates the `replit-viewer` branch. Import that branch into Replit so the Replit app only sees the lightweight viewer files.
+
+The Replit launcher sets `DASHBOARD_DATA_BASE_URL` to the raw GitHub URL for the `replit-viewer` branch. That lets an already-published app load fresh CSV data from GitHub after each publish script run, without requiring a full Replit redeploy for data-only updates.
