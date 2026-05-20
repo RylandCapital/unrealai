@@ -1,5 +1,5 @@
 run = "python -m streamlit run app.py --server.address 0.0.0.0 --server.port 3000 --server.headless true"
 
 [deployment]
-build = "pip install -r requirements.txt"
+build = "python -m pip install -r requirements.txt"
 run = ["sh", "-c", "python -m streamlit run app.py --server.address 0.0.0.0 --server.port 3000 --server.headless true"]
