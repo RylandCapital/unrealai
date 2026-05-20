@@ -1,4 +1,5 @@
-run = "streamlit run unrealai/dashboard.py --server.address 0.0.0.0 --server.port 3000 --server.headless true"
+run = "python -m streamlit run unrealai/dashboard.py --server.address 0.0.0.0 --server.port 3000 --server.headless true"
 
 [deployment]
-run = ["sh", "-c", "streamlit run unrealai/dashboard.py --server.address 0.0.0.0 --server.port 3000 --server.headless true"]
+build = "pip install -r requirements.viewer.txt"
+run = ["sh", "-c", "python -m streamlit run unrealai/dashboard.py --server.address 0.0.0.0 --server.port 3000 --server.headless true"]
