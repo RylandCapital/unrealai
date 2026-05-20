@@ -1,0 +1,4 @@
+run = "streamlit run unrealai/dashboard.py --server.address 0.0.0.0 --server.port 3000 --server.headless true"
+
+[deployment]
+run = ["sh", "-c", "streamlit run unrealai/dashboard.py --server.address 0.0.0.0 --server.port 3000 --server.headless true"]
