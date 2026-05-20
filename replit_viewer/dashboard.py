@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -16,6 +17,8 @@ APP_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = Path(os.getenv("DASHBOARD_DATA_DIR", str(APP_DIR / "dashboard_data"))).expanduser()
 FALLBACK_DATA_DIR = Path("dashboard_data")
 DEFAULT_ALLOCATION_DIR = APP_DIR / "allocations"
+DEFAULT_REMOTE_DATA_BASE_URL = "https://raw.githubusercontent.com/RylandCapital/unrealai/replit-viewer/dashboard_data"
+DASHBOARD_DATA_BASE_URL = os.getenv("DASHBOARD_DATA_BASE_URL", "").strip().rstrip("/")
 
 
 def allocation_path(env_name: str, local_filename: str, windows_path: str) -> Path:
@@ -260,7 +263,13 @@ def inject_css() -> None:
     )
 
 
-def detect_data_dir() -> Path:
+def is_url(value: str) -> bool:
+    return value.startswith(("http://", "https://"))
+
+
+def detect_data_source() -> str:
+    if DASHBOARD_DATA_BASE_URL:
+        return DASHBOARD_DATA_BASE_URL
     return DEFAULT_DATA_DIR if DEFAULT_DATA_DIR.exists() else FALLBACK_DATA_DIR
 
 
@@ -274,12 +283,22 @@ def get_available_model_options() -> list[str]:
 
 @st.cache_data(show_spinner=False)
 def load_json(path: str) -> dict:
+    if is_url(path):
+        with urllib.request.urlopen(path, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
 @st.cache_data(show_spinner=False)
 def load_table_auto(base_path: str) -> pd.DataFrame:
+    if is_url(base_path):
+        df = pd.read_csv(f"{base_path}.csv")
+        for col in DATE_LIKE_COLS:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+        return df
+
     parquet_path = Path(f"{base_path}.parquet")
     csv_path = Path(f"{base_path}.csv")
 
@@ -304,6 +323,18 @@ def load_table_auto(base_path: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_bundle(data_dir_str: str) -> dict:
+    if is_url(data_dir_str):
+        data_dir = data_dir_str.rstrip("/")
+        return {
+            "data_dir": data_dir,
+            "summary": load_json(f"{data_dir}/summary.json"),
+            "morning_report": load_table_auto(f"{data_dir}/morning_report"),
+            "symbol_metrics": load_table_auto(f"{data_dir}/symbol_metrics"),
+            "symbol_timeseries": load_table_auto(f"{data_dir}/symbol_timeseries"),
+            "trade_log": load_table_auto(f"{data_dir}/trade_log"),
+            "aggregate_timeseries": load_table_auto(f"{data_dir}/aggregate_timeseries"),
+        }
+
     data_dir = Path(data_dir_str)
     summary_path = data_dir / "summary.json"
     if not summary_path.exists():
@@ -1518,7 +1549,7 @@ def render_model_toggle() -> str:
 def main() -> None:
     inject_css()
 
-    data_dir = detect_data_dir()
+    data_dir = detect_data_source()
     try:
         bundle = load_bundle(str(data_dir))
     except Exception as exc:

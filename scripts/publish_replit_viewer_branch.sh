@@ -9,7 +9,7 @@ REMOTE_NAME="${REPLIT_VIEWER_REMOTE:-origin}"
 
 "$ROOT_DIR/scripts/package_replit_viewer.sh"
 
-if [[ -d "$WORKTREE_DIR" && ! -d "$WORKTREE_DIR/.git" ]]; then
+if [[ -d "$WORKTREE_DIR" && ! -e "$WORKTREE_DIR/.git" ]]; then
   echo "Publish worktree path exists but is not a git worktree: $WORKTREE_DIR" >&2
   exit 1
 fi
