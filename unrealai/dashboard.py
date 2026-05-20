@@ -281,7 +281,7 @@ def get_available_model_options() -> list[str]:
     return options
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300)
 def load_json(path: str) -> dict:
     if is_url(path):
         with urllib.request.urlopen(path, timeout=20) as response:
@@ -290,7 +290,7 @@ def load_json(path: str) -> dict:
         return json.load(f)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300)
 def load_table_auto(base_path: str) -> pd.DataFrame:
     if is_url(base_path):
         df = pd.read_csv(f"{base_path}.csv")
@@ -321,7 +321,7 @@ def load_table_auto(base_path: str) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300)
 def load_bundle(data_dir_str: str) -> dict:
     if is_url(data_dir_str):
         data_dir = data_dir_str.rstrip("/")
