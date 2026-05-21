@@ -1,0 +1,18 @@
+entrypoint = "app.py"
+modules = ["python-3.11"]
+
+run = "python3 -m streamlit run app.py --server.address 0.0.0.0 --server.port 3000 --server.headless true"
+
+[nix]
+channel = "stable-23_05"
+
+[unitTest]
+language = "python3"
+
+[gitHubImport]
+requiredFiles = [".replit", "replit.nix"]
+
+[deployment]
+build = "python3 -m venv .venv && .venv/bin/python -m pip install --no-user --upgrade pip && .venv/bin/python -m pip install --no-user -r requirements.txt"
+run = ["sh", "-c", ".venv/bin/python -m streamlit run app.py --server.address 0.0.0.0 --server.port 3000 --server.headless true"]
+deploymentTarget = "cloudrun"

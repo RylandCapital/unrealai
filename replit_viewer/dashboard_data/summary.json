@@ -1,0 +1,19 @@
+{
+  "as_of": "2026-05-20",
+  "report_start_date": "2026-03-26",
+  "primary_fill_mode": "open_t_plus_1",
+  "total_symbols": 45,
+  "open_positions": 26,
+  "closed_positions": 19,
+  "total_return_pct": 13.674414867940676,
+  "benchmark_return_pct": 0.0,
+  "alpha_pct": 0.0,
+  "unrealized_pnl": 222540517.12602997,
+  "realized_pnl": 392808151.93129814,
+  "total_pnl": 615348669.0573281,
+  "max_drawdown_pct": -1.8914180228521427,
+  "win_rate_pct": 67.3076923076923,
+  "avg_trade_return_pct": 7.585644547299026,
+  "exposure_pct": 57.77777777777777,
+  "total_trades": 52
+}
