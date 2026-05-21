@@ -26,8 +26,8 @@ except ModuleNotFoundError:
 # CONFIG
 # =============================================================================
 START_DATE = pd.Timestamp("2010-01-01")
-TEST_DAYS = 180
-ALWAYS_RUN_TICKERS = ["QQQE", "RSP", "EQAL"]
+TEST_DAYS = 60
+ALWAYS_RUN_TICKERS = ["QQQ", 'SPY', 'DIA', 'IWF']
 
 # Pull a warmup window before the last saved date so rolling features remain valid
 # when appending new rows.

@@ -256,7 +256,7 @@ class CFG:
 
     AGGREGATE_BENCHMARK_SYMBOLS = [
         s.strip().upper()
-        for s in os.getenv("AGGREGATE_BENCHMARK_SYMBOLS", "EQAL,RSP,QQQE").split(",")
+        for s in os.getenv("AGGREGATE_BENCHMARK_SYMBOLS", "SPY,DIA,IWF,QQQ").split(",")
         if s.strip()
     ]
     EXCLUDE_AGGREGATE_BENCHMARKS_FROM_TRAINING = env_bool("EXCLUDE_AGGREGATE_BENCHMARKS_FROM_TRAINING", True)
@@ -270,12 +270,10 @@ class CFG:
     FILL_MODE_CLOSE_T = "close_t"
     FILL_MODE_OPEN_T1 = "open_t_plus_1"
     FILL_MODE_HL2_T1 = "hl2_t_plus_1"
-    FILL_MODE_OPEN_T1_DISCOUNT_ONLY = "open_t_plus_1_discount_only"
     ALL_FILL_MODES = [
         FILL_MODE_CLOSE_T,
         FILL_MODE_OPEN_T1,
         FILL_MODE_HL2_T1,
-        FILL_MODE_OPEN_T1_DISCOUNT_ONLY,
     ]
 
 
@@ -2507,8 +2505,6 @@ def get_fill_mode_display_name(fill_mode: str) -> str:
         return "Open T+1"
     if fill_mode == CFG.FILL_MODE_HL2_T1:
         return "HL2 T+1"
-    if fill_mode == CFG.FILL_MODE_OPEN_T1_DISCOUNT_ONLY:
-        return "Open T+1 Discount Only"
     return str(fill_mode)
 
 
@@ -2571,7 +2567,7 @@ def plot_aggregated_results_multi(curves_dict, invested_dict, stats_by_mode, dat
     )
 
     fig.add_trace(
-        go.Scatter(x=dates, y=curves_dict["buy_hold"], mode="lines", name="Selected Basket B&H"),
+        go.Scatter(x=dates, y=curves_dict["buy_hold"], mode="lines", name="Selected Model Buy & Hold"),
         row=1, col=1
     )
 
@@ -2611,7 +2607,7 @@ def plot_aggregated_results_multi(curves_dict, invested_dict, stats_by_mode, dat
         )
 
     fig.update_layout(
-        title="Aggregated Performance: Strategy vs Selected Basket and Equal-Weight ETF Benchmarks",
+        title="Aggregated Performance: Strategy vs Selected Model and ETF Benchmarks",
         hovermode="x unified"
     )
 
@@ -2916,7 +2912,7 @@ def generate_test_signal_log(agent, df, *, window_size=20, initial_cash=100_000,
 def get_fill_price(df, idx: int, fill_mode: str) -> float:
     if fill_mode == CFG.FILL_MODE_CLOSE_T:
         return float(df["adjusted_close"].iloc[idx])
-    if fill_mode in (CFG.FILL_MODE_OPEN_T1, CFG.FILL_MODE_OPEN_T1_DISCOUNT_ONLY):
+    if fill_mode == CFG.FILL_MODE_OPEN_T1:
         return float(df["eval_open"].iloc[idx])
     if fill_mode == CFG.FILL_MODE_HL2_T1:
         return float((df["eval_high"].iloc[idx] + df["eval_low"].iloc[idx]) / 2.0)
@@ -3038,12 +3034,7 @@ def replay_signals_with_fill_mode(df, signal_rows, fill_mode: str, *,
         cooldown_remaining = win_cd if float(pct) > 0.0 else loss_cd
 
     def _entry_filter_passes(signal_idx: int, fill_idx: int, fill_px: float) -> bool:
-        if fill_mode != CFG.FILL_MODE_OPEN_T1_DISCOUNT_ONLY:
-            return True
-        if fill_idx <= signal_idx:
-            return False
-        signal_close = float(closes[signal_idx])
-        return float(fill_px) < signal_close
+        return True
 
     def _stop_or_take_reason(idx: int) -> str:
         if position != 1 or entry_price <= 0:

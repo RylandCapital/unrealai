@@ -223,11 +223,21 @@ class CFG:
 
     TRAIN_DIR = APP_DIR / "traindata"
     TEST_DIR  = APP_DIR / "testdata"
+    REPORT_ONLY_BENCHMARK_SYMBOLS = [
+        s.strip().upper()
+        for s in os.getenv("REPORT_ONLY_BENCHMARK_SYMBOLS", "SPY,DIA,IWF,QQQ").split(",")
+        if s.strip()
+    ]
+    EXCLUDE_REPORT_ONLY_BENCHMARKS_FROM_TRAINING = os.getenv(
+        "EXCLUDE_REPORT_ONLY_BENCHMARKS_FROM_TRAINING", "1"
+    ).strip().lower() not in {"0", "false", "no", "off"}
 
     train_map = {p.stem.upper(): p for p in TRAIN_DIR.glob("*.csv")}
     test_map  = {p.stem.upper(): p for p in TEST_DIR.glob("*.csv")}
 
     common_symbols = sorted(set(train_map) & set(test_map))
+    if EXCLUDE_REPORT_ONLY_BENCHMARKS_FROM_TRAINING:
+        common_symbols = [sym for sym in common_symbols if sym not in set(REPORT_ONLY_BENCHMARK_SYMBOLS)]
 
     if not common_symbols:
         raise FileNotFoundError("No matching CSV symbols found in both traindata and testdata.")
@@ -248,12 +258,10 @@ class CFG:
     FILL_MODE_CLOSE_T = "close_t"
     FILL_MODE_OPEN_T1 = "open_t_plus_1"
     FILL_MODE_HL2_T1 = "hl2_t_plus_1"
-    FILL_MODE_OPEN_T1_DISCOUNT_ONLY = "open_t_plus_1_discount_only"
     ALL_FILL_MODES = [
         FILL_MODE_CLOSE_T,
         FILL_MODE_OPEN_T1,
         FILL_MODE_HL2_T1,
-        FILL_MODE_OPEN_T1_DISCOUNT_ONLY,
     ]
 
 
@@ -2084,8 +2092,6 @@ def get_fill_mode_display_name(fill_mode: str) -> str:
         return "Open T+1"
     if fill_mode == CFG.FILL_MODE_HL2_T1:
         return "HL2 T+1"
-    if fill_mode == CFG.FILL_MODE_OPEN_T1_DISCOUNT_ONLY:
-        return "Open T+1 Discount Only"
     return str(fill_mode)
 
 
@@ -2462,7 +2468,7 @@ def generate_test_signal_log(agent, df, *, window_size=20, initial_cash=100_000,
 def get_fill_price(df, idx: int, fill_mode: str) -> float:
     if fill_mode == CFG.FILL_MODE_CLOSE_T:
         return float(df["adjusted_close"].iloc[idx])
-    if fill_mode in (CFG.FILL_MODE_OPEN_T1, CFG.FILL_MODE_OPEN_T1_DISCOUNT_ONLY):
+    if fill_mode == CFG.FILL_MODE_OPEN_T1:
         return float(df["eval_open"].iloc[idx])
     if fill_mode == CFG.FILL_MODE_HL2_T1:
         return float((df["eval_high"].iloc[idx] + df["eval_low"].iloc[idx]) / 2.0)
@@ -2580,12 +2586,7 @@ def replay_signals_with_fill_mode(df, signal_rows, fill_mode: str, *,
         cooldown_remaining = win_cd if float(pct) > 0.0 else loss_cd
 
     def _entry_filter_passes(signal_idx: int, fill_idx: int, fill_px: float) -> bool:
-        if fill_mode != CFG.FILL_MODE_OPEN_T1_DISCOUNT_ONLY:
-            return True
-        if fill_idx <= signal_idx:
-            return False
-        signal_close = float(closes[signal_idx])
-        return float(fill_px) < signal_close
+        return True
 
     for idx in range(first_step, last_step + 1):
         if pending_order is not None and int(pending_order["fill_idx"]) == idx:

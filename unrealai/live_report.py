@@ -113,7 +113,7 @@ class CFG:
     REPORT_VWAP_MODULE_PATH = os.getenv("REPORT_VWAP_MODULE_PATH", str(APP_DIR / "utils" / "overwatch_chart.py"))
     AGGREGATE_BENCHMARK_SYMBOLS = [
         s.strip().upper()
-        for s in os.getenv("AGGREGATE_BENCHMARK_SYMBOLS", "EQAL,RSP,QQQE").split(",")
+        for s in os.getenv("AGGREGATE_BENCHMARK_SYMBOLS", "SPY,DIA,IWF,QQQ").split(",")
         if s.strip()
     ]
 
