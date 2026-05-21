@@ -19,6 +19,7 @@ FALLBACK_DATA_DIR = Path("dashboard_data")
 DEFAULT_ALLOCATION_DIR = APP_DIR / "allocations"
 DEFAULT_REMOTE_DATA_BASE_URL = "https://raw.githubusercontent.com/RylandCapital/unrealai/replit-viewer/dashboard_data"
 DASHBOARD_DATA_BASE_URL = os.getenv("DASHBOARD_DATA_BASE_URL", "").strip().rstrip("/")
+MODEL_SYMBOLS_FILENAME = "model_symbols.json"
 
 
 def allocation_path(env_name: str, local_filename: str, windows_path: str) -> Path:
@@ -60,9 +61,14 @@ MODEL_CONFIG = {
 MODEL_OPTIONS = ["ALL SYMBOLS", "GRIP", "EDIP"]
 REPORT_ONLY_BENCHMARK_SYMBOLS = {
     s.strip().upper()
-    for s in os.getenv("REPORT_ONLY_BENCHMARK_SYMBOLS", "SPY,DIA,IWF,QQQ").split(",")
+    for s in os.getenv("REPORT_ONLY_BENCHMARK_SYMBOLS", "SPY,DIA,IWF,QQQ,EQAL,RSP,QQQE").split(",")
     if s.strip()
 }
+
+CHART_BG = "#0b0f14"
+CHART_GRID = "rgba(232,237,242,0.14)"
+CHART_FONT = "#e8edf2"
+CHART_BAR = "#6b73ff"
 
 DATE_LIKE_COLS = [
     "date",
@@ -273,10 +279,11 @@ def detect_data_source() -> str:
     return DEFAULT_DATA_DIR if DEFAULT_DATA_DIR.exists() else FALLBACK_DATA_DIR
 
 
-def get_available_model_options() -> list[str]:
+def get_available_model_options(bundle: Optional[dict] = None) -> list[str]:
     options = ["ALL SYMBOLS"]
+    bundled_symbols = (bundle or {}).get("model_symbols", {})
     for model_name in ("GRIP", "EDIP"):
-        if MODEL_CONFIG[model_name]["path"].exists():
+        if bundled_symbols.get(model_name) or MODEL_CONFIG[model_name]["path"].exists():
             options.append(model_name)
     return options
 
@@ -288,6 +295,27 @@ def load_json(path: str) -> dict:
             return json.loads(response.read().decode("utf-8"))
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def load_model_symbols_file(data_dir_str: str) -> dict[str, list[str]]:
+    try:
+        if is_url(data_dir_str):
+            raw = load_json(f"{data_dir_str.rstrip('/')}/{MODEL_SYMBOLS_FILENAME}")
+        else:
+            path = Path(data_dir_str) / MODEL_SYMBOLS_FILENAME
+            if not path.exists():
+                return {}
+            raw = load_json(str(path))
+    except Exception:
+        return {}
+
+    out: dict[str, list[str]] = {}
+    for model_name, values in raw.items():
+        cleaned = clean_model_symbols(list(values or []))
+        if cleaned:
+            out[str(model_name).upper()] = cleaned
+    return out
 
 
 @st.cache_data(show_spinner=False, ttl=300)
@@ -327,6 +355,7 @@ def load_bundle(data_dir_str: str) -> dict:
         data_dir = data_dir_str.rstrip("/")
         return {
             "data_dir": data_dir,
+            "model_symbols": load_model_symbols_file(data_dir),
             "summary": load_json(f"{data_dir}/summary.json"),
             "morning_report": load_table_auto(f"{data_dir}/morning_report"),
             "symbol_metrics": load_table_auto(f"{data_dir}/symbol_metrics"),
@@ -342,6 +371,7 @@ def load_bundle(data_dir_str: str) -> dict:
 
     return {
         "data_dir": data_dir,
+        "model_symbols": load_model_symbols_file(str(data_dir)),
         "summary": load_json(str(summary_path)),
         "morning_report": load_table_auto(str(data_dir / "morning_report")),
         "symbol_metrics": load_table_auto(str(data_dir / "symbol_metrics")),
@@ -525,9 +555,13 @@ def clean_model_symbols(values: list[object]) -> list[str]:
 
 
 @st.cache_data(show_spinner=False)
-def load_model_symbols(model_name: str) -> list[str]:
+def load_model_symbols(model_name: str, bundled_model_symbols: Optional[dict] = None) -> list[str]:
     if model_name == "ALL SYMBOLS":
         return []
+
+    bundled = (bundled_model_symbols or {}).get(model_name)
+    if bundled:
+        return clean_model_symbols(list(bundled))
 
     cfg = MODEL_CONFIG[model_name]
     path = cfg["path"]
@@ -577,15 +611,8 @@ def build_aggregate_from_symbol_timeseries(sym_ts: pd.DataFrame) -> pd.DataFrame
     if work.empty:
         return pd.DataFrame()
 
-    expected_symbols = set(work[sym_col].dropna().astype(str).unique())
-    date_symbols = work.groupby(dcol)[sym_col].agg(lambda s: set(s.dropna().astype(str)))
-    complete_dates = date_symbols[date_symbols.map(lambda symbols: symbols == expected_symbols)].index
-    work_complete = work[work[dcol].isin(complete_dates)].copy()
-    if work_complete.empty:
-        return pd.DataFrame()
-
     result = (
-        work_complete[[dcol]]
+        work[[dcol]]
         .drop_duplicates()
         .sort_values(dcol)
         .reset_index(drop=True)
@@ -602,13 +629,13 @@ def build_aggregate_from_symbol_timeseries(sym_ts: pd.DataFrame) -> pd.DataFrame
         if src_col is None:
             continue
 
-        tmp = work_complete[[sym_col, dcol, src_col]].copy()
+        tmp = work[[sym_col, dcol, src_col]].copy()
         tmp[src_col] = pd.to_numeric(tmp[src_col], errors="coerce")
         pivot = tmp.pivot_table(index=dcol, columns=sym_col, values=src_col, aggfunc="last").sort_index()
         agg_series = pivot.sum(axis=1, min_count=1).rename(out_col).reset_index()
         result = result.merge(agg_series, on=dcol, how="left")
 
-    stance_work = add_stance_column(work_complete)
+    stance_work = add_stance_column(work)
     if "activity_stance" in stance_work.columns:
         tmp = stance_work[[sym_col, dcol]].copy()
         tmp["open_positions"] = stance_work["activity_stance"].eq("LONG").astype(int)
@@ -616,7 +643,7 @@ def build_aggregate_from_symbol_timeseries(sym_ts: pd.DataFrame) -> pd.DataFrame
         open_pos = pos_pivot.sum(axis=1, min_count=1).rename("open_positions").reset_index()
         result = result.merge(open_pos, on=dcol, how="left")
 
-    reporting_work = work_complete[[sym_col, dcol]].copy()
+    reporting_work = work[[sym_col, dcol]].copy()
     reporting_work["_present"] = 1
     reporting_pivot = reporting_work.pivot_table(index=dcol, columns=sym_col, values="_present", aggfunc="last").sort_index()
     reporting = reporting_pivot.notna().sum(axis=1).rename("symbols_reporting").reset_index()
@@ -869,6 +896,9 @@ def make_portfolio_chart(agg: pd.DataFrame, primary_fill_mode: str, benchmark_sy
         template="plotly_dark",
         height=350,
         margin=dict(l=10, r=10, t=10, b=10),
+        paper_bgcolor=CHART_BG,
+        plot_bgcolor=CHART_BG,
+        font=dict(color=CHART_FONT),
         legend=dict(
             orientation="h",
             yanchor="bottom",
@@ -880,6 +910,7 @@ def make_portfolio_chart(agg: pd.DataFrame, primary_fill_mode: str, benchmark_sy
         ),
         hovermode="x unified",
     )
+    fig.update_xaxes(gridcolor=CHART_GRID, zerolinecolor=CHART_GRID)
     fig.update_yaxes(title_text="Return %")
     return fig
 
@@ -894,7 +925,7 @@ def make_open_positions_chart(agg: pd.DataFrame) -> go.Figure:
         return fig
 
     positions = pd.to_numeric(agg[pos_col], errors="coerce")
-    fig.add_trace(go.Bar(x=agg[dcol], y=positions, name="Open Positions"), secondary_y=False)
+    fig.add_trace(go.Bar(x=agg[dcol], y=positions, name="Open Positions", marker=dict(color=CHART_BAR)), secondary_y=False)
 
     reporting_col = maybe_col(agg, ["symbols_reporting"])
     avg_exposure = np.nan
@@ -922,11 +953,14 @@ def make_open_positions_chart(agg: pd.DataFrame) -> go.Figure:
         template="plotly_dark",
         height=220,
         margin=dict(l=10, r=10, t=10, b=10),
+        paper_bgcolor=CHART_BG,
+        plot_bgcolor=CHART_BG,
+        font=dict(color=CHART_FONT),
         showlegend=pd.notna(avg_exposure),
     )
-    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-    fig.update_yaxes(title_text="Positions", range=[0, max(max_reporting, 1)], secondary_y=False)
-    fig.update_yaxes(title_text="Exposure %", range=[0, 100], ticksuffix="%", secondary_y=True)
+    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], gridcolor=CHART_GRID, zerolinecolor=CHART_GRID)
+    fig.update_yaxes(title_text="Positions", range=[0, max(max_reporting, 1)], gridcolor=CHART_GRID, zerolinecolor=CHART_GRID, secondary_y=False)
+    fig.update_yaxes(title_text="Exposure %", range=[0, 100], ticksuffix="%", gridcolor=CHART_GRID, zerolinecolor=CHART_GRID, secondary_y=True)
     return fig
 
 
@@ -962,6 +996,9 @@ def make_symbol_chart(symbol: str, sym_ts: pd.DataFrame, primary_fill_mode: str)
         template="plotly_dark",
         height=420,
         margin=dict(l=10, r=10, t=10, b=10),
+        paper_bgcolor=CHART_BG,
+        plot_bgcolor=CHART_BG,
+        font=dict(color=CHART_FONT),
         legend=dict(
             orientation="h",
             yanchor="bottom",
@@ -973,6 +1010,7 @@ def make_symbol_chart(symbol: str, sym_ts: pd.DataFrame, primary_fill_mode: str)
         ),
         hovermode="x unified",
     )
+    fig.update_xaxes(gridcolor=CHART_GRID, zerolinecolor=CHART_GRID)
     fig.update_yaxes(title_text="Equity")
     return fig
 
@@ -1016,6 +1054,9 @@ def make_symbol_exposure_chart(symbol: str, sym_ts: pd.DataFrame) -> go.Figure:
         template="plotly_dark",
         height=220,
         margin=dict(l=10, r=10, t=10, b=10),
+        paper_bgcolor=CHART_BG,
+        plot_bgcolor=CHART_BG,
+        font=dict(color=CHART_FONT),
         legend=dict(
             orientation="h",
             yanchor="bottom",
@@ -1028,8 +1069,8 @@ def make_symbol_exposure_chart(symbol: str, sym_ts: pd.DataFrame) -> go.Figure:
         hovermode="x unified",
         showlegend=pd.notna(avg_exposure),
     )
-    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-    fig.update_yaxes(title_text="Exposure %", range=[0, 100], ticksuffix="%")
+    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], gridcolor=CHART_GRID, zerolinecolor=CHART_GRID)
+    fig.update_yaxes(title_text="Exposure %", range=[0, 100], ticksuffix="%", gridcolor=CHART_GRID, zerolinecolor=CHART_GRID)
     return fig
 
 
@@ -1117,6 +1158,9 @@ def make_attribution_chart(attribution: pd.DataFrame) -> go.Figure:
         template="plotly_dark",
         height=max(340, 28 * len(attribution) + 80),
         margin=dict(l=10, r=10, t=10, b=10),
+        paper_bgcolor=CHART_BG,
+        plot_bgcolor=CHART_BG,
+        font=dict(color=CHART_FONT),
         showlegend=False,
     )
     fig.update_xaxes(title_text="Alpha vs Buy & Hold (pts)", zeroline=True, zerolinecolor="rgba(255,255,255,0.35)")
@@ -1519,8 +1563,8 @@ def render_diagnostics(filtered: dict) -> None:
         st.dataframe(convert_for_display(reporting_gaps), use_container_width=True, hide_index=True)
 
 
-def render_model_toggle() -> str:
-    options = get_available_model_options()
+def render_model_toggle(bundle: dict) -> str:
+    options = get_available_model_options(bundle)
     if len(options) == 1:
         return options[0]
 
@@ -1558,10 +1602,10 @@ def main() -> None:
         st.info("Run the refactored live_report first so dashboard_data contains the summary and tables.")
         return
 
-    selected_model = render_model_toggle()
+    selected_model = render_model_toggle(bundle)
 
     try:
-        model_symbols = load_model_symbols(selected_model)
+        model_symbols = load_model_symbols(selected_model, bundle.get("model_symbols", {}))
     except Exception as exc:
         st.markdown(f"<div class='app-title'>{APP_TITLE}</div>", unsafe_allow_html=True)
         st.error(str(exc))
