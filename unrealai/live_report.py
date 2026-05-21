@@ -116,6 +116,14 @@ class CFG:
         for s in os.getenv("AGGREGATE_BENCHMARK_SYMBOLS", "EQAL,RSP,QQQE").split(",")
         if s.strip()
     ]
+    DATA_ONLY_SYMBOLS = [
+        s.strip().upper()
+        for s in os.getenv(
+            "DATA_ONLY_SYMBOLS",
+            "EQAL,RSP,QQQE,QQQ,SPY,DIA,IWF,XLB,XLC,XLE,XLF,XLI,XLK,XLP,XLU,XLV,XLY,SMH",
+        ).split(",")
+        if s.strip()
+    ]
 
 
     # None = auto-discover from DATA_DIR
@@ -2280,13 +2288,14 @@ def save_plotly_figure(fig: go.Figure, output_path: Path) -> None:
 def discover_symbols(data_dir: str):
     symbols = sorted([p.stem.upper() for p in Path(data_dir).glob("*.csv")])
     benchmark_symbols = set(getattr(CFG, "AGGREGATE_BENCHMARK_SYMBOLS", []))
+    data_only_symbols = set(getattr(CFG, "DATA_ONLY_SYMBOLS", []))
     runnable = []
     skipped_no_checkpoint = []
     for symbol in symbols:
         ckpt = get_checkpoint_paths(CFG.MODEL_DIR, symbol)
         if os.path.exists(ckpt["policy"]) and os.path.exists(ckpt["scaler"]):
             runnable.append(symbol)
-        elif symbol in benchmark_symbols:
+        elif symbol in benchmark_symbols or symbol in data_only_symbols:
             continue
         else:
             skipped_no_checkpoint.append(symbol)

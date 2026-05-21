@@ -259,6 +259,14 @@ class CFG:
         for s in os.getenv("AGGREGATE_BENCHMARK_SYMBOLS", "EQAL,RSP,QQQE").split(",")
         if s.strip()
     ]
+    DATA_ONLY_SYMBOLS = [
+        s.strip().upper()
+        for s in os.getenv(
+            "DATA_ONLY_SYMBOLS",
+            "EQAL,RSP,QQQE,QQQ,SPY,DIA,IWF,XLB,XLC,XLE,XLF,XLI,XLK,XLP,XLU,XLV,XLY,SMH",
+        ).split(",")
+        if s.strip()
+    ]
     EXCLUDE_AGGREGATE_BENCHMARKS_FROM_TRAINING = env_bool("EXCLUDE_AGGREGATE_BENCHMARKS_FROM_TRAINING", True)
 
     
@@ -1096,7 +1104,8 @@ def discover_symbol_file_pairs(train_dir, test_dir) -> tuple[list[str], list[str
     common_symbols = sorted(set(train_map) & set(test_map))
     if bool(getattr(CFG, "EXCLUDE_AGGREGATE_BENCHMARKS_FROM_TRAINING", True)):
         benchmark_symbols = set(normalize_symbol_list(getattr(CFG, "AGGREGATE_BENCHMARK_SYMBOLS", [])))
-        common_symbols = [sym for sym in common_symbols if sym not in benchmark_symbols]
+        data_only_symbols = set(normalize_symbol_list(getattr(CFG, "DATA_ONLY_SYMBOLS", [])))
+        common_symbols = [sym for sym in common_symbols if sym not in benchmark_symbols | data_only_symbols]
 
     if not common_symbols:
         raise FileNotFoundError(f"No matching CSV symbols found in both {train_dir} and {test_dir}.")
@@ -3846,6 +3855,7 @@ if __name__ == "__main__":
     print(f"Resume from checkpoint: {CFG.RESUME_FROM_CHECKPOINT}")
     print(f"Reuse saved scaler: {CFG.REUSE_SAVED_SCALER}")
     print(f"Aggregate ETF benchmarks: {CFG.AGGREGATE_BENCHMARK_SYMBOLS}")
+    print(f"Data-only symbols excluded from training: {CFG.DATA_ONLY_SYMBOLS}")
     print(f"Exclude aggregate benchmarks from training: {CFG.EXCLUDE_AGGREGATE_BENCHMARKS_FROM_TRAINING}")
 
     output_dir = str(CFG.OUTPUT_DIR)

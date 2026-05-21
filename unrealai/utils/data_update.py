@@ -26,8 +26,9 @@ except ModuleNotFoundError:
 # CONFIG
 # =============================================================================
 START_DATE = pd.Timestamp("2010-01-01")
-TEST_DAYS = 180
-ALWAYS_RUN_TICKERS = ["QQQE", "RSP", "EQAL"]
+TEST_DAYS = 60
+ALWAYS_RUN_TICKERS = ["QQQ", "SPY", "DIA", "IWF"]
+AGGREGATE_BENCHMARK_TICKERS = ["EQAL", "RSP", "QQQE"]
 
 # Pull a warmup window before the last saved date so rolling features remain valid
 # when appending new rows.
@@ -124,6 +125,9 @@ SECTOR_PROXY_MAP = {
     "QQQ":"QQQ"
 }
 
+SECTOR_PROXY_TICKERS = sorted(set(SECTOR_PROXY_MAP.values()))
+DATA_ONLY_TICKERS = sorted(set(ALWAYS_RUN_TICKERS) | set(AGGREGATE_BENCHMARK_TICKERS) | set(SECTOR_PROXY_TICKERS))
+
 
 def _dedupe_preserve_order(values) -> list[str]:
     seen = set()
@@ -200,7 +204,7 @@ def load_allocation_tickers() -> tuple[list[str], list[str]]:
 
 
 def add_always_run_tickers(tickers: list[str]) -> list[str]:
-    return _dedupe_preserve_order(tickers + ALWAYS_RUN_TICKERS)
+    return _dedupe_preserve_order(tickers + DATA_ONLY_TICKERS)
 
 
 def load_configured_tickers() -> list[str]:
@@ -977,9 +981,9 @@ def combine_existing_with_new(existing_df: pd.DataFrame, new_df: pd.DataFrame) -
     if existing_df.empty:
         out = new_df.copy()
     else:
-        last_existing_date = pd.to_datetime(existing_df["Date"]).max()
-        append_df = new_df[new_df["Date"] > last_existing_date].copy()
-        out = pd.concat([existing_df, append_df], axis=0, ignore_index=True)
+        refresh_start = pd.to_datetime(new_df["Date"]).min()
+        keep_existing = existing_df[pd.to_datetime(existing_df["Date"]) < refresh_start].copy()
+        out = pd.concat([keep_existing, new_df], axis=0, ignore_index=True)
 
     out["Date"] = pd.to_datetime(out["Date"])
     out = out.sort_values("Date").drop_duplicates(subset=["Date"], keep="last").reset_index(drop=True)
@@ -989,13 +993,14 @@ def combine_existing_with_new(existing_df: pd.DataFrame, new_df: pd.DataFrame) -
 # =============================================================================
 # UPDATE LOGIC
 # =============================================================================
-def update_one_ticker(ticker: str):
+def update_one_ticker(ticker: str, *, full_rebuild: bool = False):
     existing_df = load_existing_feature_history(ticker)
 
-    if existing_df.empty:
-        print(f"\n[{ticker}] No existing train/test found. Full rebuild from {START_DATE.date()}.")
+    if full_rebuild or existing_df.empty:
+        reason = "Forced full rebuild" if full_rebuild else "No existing train/test found"
+        print(f"\n[{ticker}] {reason}. Full rebuild from {START_DATE.date()}.")
         combined_df = get_daily_equity(ticker, start_date=START_DATE)
-        added_rows = len(combined_df)
+        added_rows = len(combined_df) - len(existing_df)
     else:
         last_old_date = pd.to_datetime(existing_df["Date"]).max().normalize()
         incremental_start = max(
@@ -1065,7 +1070,7 @@ def cleanup_non_model_datasets() -> list[Path]:
         )
         return []
 
-    keep_symbols = model_symbols | set(ALWAYS_RUN_TICKERS)
+    keep_symbols = model_symbols | set(DATA_ONLY_TICKERS)
     removed_paths = []
 
     for directory in (TRAIN_DIR, TEST_DIR):
@@ -1111,6 +1116,11 @@ def parse_args():
         "--list-config",
         action="store_true",
         help="Print resolved paths and tickers without updating data.",
+    )
+    parser.add_argument(
+        "--full-rebuild",
+        action="store_true",
+        help="Rebuild selected symbols from START_DATE instead of refreshing only the warmup window.",
     )
     args, unknown = parser.parse_known_args()
     if unknown:
@@ -1172,7 +1182,7 @@ def main():
     cleanup_non_model_datasets()
 
     for ticker in tickers:
-        update_one_ticker(ticker)
+        update_one_ticker(ticker, full_rebuild=bool(args.full_rebuild))
 
 
 if __name__ == "__main__":
