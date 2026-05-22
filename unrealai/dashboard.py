@@ -208,8 +208,50 @@ def inject_css() -> None:
                 line-height: 1.3;
                 margin: 0 0 0.35rem 0;
             }
-            div[data-testid="stDataFrame"] div[role="table"] {
+            .dark-table-wrap {
+                max-height: 420px;
+                overflow: auto;
+                border: 1px solid rgba(255,255,255,0.10);
+                border-radius: 8px;
+                background: #0e151d;
+                margin: 0.20rem 0 0.65rem 0;
+            }
+            .dark-table {
+                width: 100%;
+                border-collapse: collapse;
                 font-size: 0.84rem;
+                color: #e8edf2;
+            }
+            .dark-table thead th {
+                position: sticky;
+                top: 0;
+                z-index: 1;
+                background: #16202b;
+                color: rgba(232,237,242,0.82);
+                border-bottom: 1px solid rgba(255,255,255,0.12);
+                font-weight: 700;
+                text-align: left;
+                padding: 0.62rem 0.72rem;
+                white-space: nowrap;
+            }
+            .dark-table tbody td {
+                background: #111821;
+                color: #e8edf2;
+                border-bottom: 1px solid rgba(255,255,255,0.07);
+                border-right: 1px solid rgba(255,255,255,0.06);
+                padding: 0.58rem 0.72rem;
+                vertical-align: top;
+                white-space: nowrap;
+            }
+            .dark-table tbody tr:nth-child(even) td {
+                background: #0f1720;
+            }
+            .dark-table tbody tr:hover td {
+                background: #172332;
+            }
+            .dark-table tbody td:last-child,
+            .dark-table thead th:last-child {
+                border-right: 0;
             }
             .activity-box {
                 background: #111821;
@@ -1318,6 +1360,15 @@ def convert_for_display(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def display_dark_table(df: pd.DataFrame) -> None:
+    if df.empty:
+        st.info("No rows to display.")
+        return
+
+    html = df.to_html(index=False, escape=True, classes="dark-table", border=0)
+    st.markdown(f"<div class='dark-table-wrap'>{html}</div>", unsafe_allow_html=True)
+
+
 def build_reporting_gaps_table(filtered: dict) -> pd.DataFrame:
     sym_ts = filtered["symbol_timeseries"]
     sym_col = get_symbol_col(sym_ts)
@@ -1436,7 +1487,7 @@ def display_trade_table(df: pd.DataFrame) -> None:
         ]
         if c in df.columns
     ]
-    st.dataframe(convert_for_display(df[keep]), use_container_width=True, hide_index=True)
+    display_dark_table(convert_for_display(df[keep]))
 
 
 def render_header(report_start: str, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> None:
@@ -1580,7 +1631,7 @@ def render_activity(filtered: dict) -> None:
         return
 
     show_cols = ["symbol", "previous_stance", "current_stance", "change_date"]
-    st.dataframe(convert_for_display(changes_df[show_cols]), use_container_width=True, hide_index=True)
+    display_dark_table(convert_for_display(changes_df[show_cols]))
 
 
 def render_symbols(filtered: dict) -> None:
@@ -1668,7 +1719,7 @@ def render_diagnostics(filtered: dict) -> None:
             ] if c in morning.columns
         ]
         st.markdown("<div class='chart-title'>Model Snapshot</div>", unsafe_allow_html=True)
-        st.dataframe(convert_for_display(morning[keep]), use_container_width=True, hide_index=True)
+        display_dark_table(convert_for_display(morning[keep]))
 
     agg = filtered["aggregate_timeseries"]
     if not agg.empty:
@@ -1685,17 +1736,17 @@ def render_diagnostics(filtered: dict) -> None:
         if rows:
             st.markdown("<div class='chart-title'>Fill Mode Snapshot</div>", unsafe_allow_html=True)
             fill_df = pd.DataFrame(rows)
-            st.dataframe(convert_for_display(fill_df), use_container_width=True, hide_index=True)
+            display_dark_table(convert_for_display(fill_df))
 
     daily_moves = build_daily_move_attribution_table(filtered)
     if not daily_moves.empty:
         st.markdown("<div class='chart-title'>Largest Daily Aggregate Drops</div>", unsafe_allow_html=True)
-        st.dataframe(convert_for_display(daily_moves), use_container_width=True, hide_index=True)
+        display_dark_table(convert_for_display(daily_moves))
 
     reporting_gaps = build_reporting_gaps_table(filtered)
     if not reporting_gaps.empty:
         st.markdown("<div class='chart-title'>Reporting Gaps</div>", unsafe_allow_html=True)
-        st.dataframe(convert_for_display(reporting_gaps), use_container_width=True, hide_index=True)
+        display_dark_table(convert_for_display(reporting_gaps))
 
 
 def render_model_toggle(bundle: dict) -> str:
