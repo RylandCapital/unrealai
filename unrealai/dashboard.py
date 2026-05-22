@@ -145,6 +145,21 @@ def inject_css() -> None:
                 padding-bottom: 0.35rem;
                 padding-left: 0;
                 padding-right: 0;
+                color: rgba(232,237,242,0.72) !important;
+            }
+            .stTabs [data-baseweb="tab"] p,
+            .stTabs [data-baseweb="tab"] span {
+                color: inherit !important;
+            }
+            .stTabs [aria-selected="true"] {
+                color: #ff5c5c !important;
+            }
+            .stCaption,
+            [data-testid="stCaptionContainer"],
+            [data-testid="stMarkdownContainer"],
+            [data-testid="stMarkdownContainer"] p,
+            [data-testid="stMarkdownContainer"] span {
+                color: #e8edf2 !important;
             }
             .kpi-card {
                 background: #111821;
@@ -239,14 +254,60 @@ def inject_css() -> None:
                 line-height: 1.3;
                 margin: 0 0 0.35rem 0;
             }
+            .model-toggle {
+                display: inline-flex;
+                align-items: center;
+                overflow: hidden;
+                border: 1px solid rgba(255,255,255,0.18);
+                border-radius: 8px;
+                background: #111821;
+                margin: 0.05rem 0 0.55rem 0;
+            }
+            .model-toggle-item {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                min-width: 6.25rem;
+                height: 2.4rem;
+                padding: 0 1.0rem;
+                border-right: 1px solid rgba(255,255,255,0.14);
+                color: rgba(232,237,242,0.68);
+                font-size: 0.84rem;
+                font-weight: 700;
+                letter-spacing: 0;
+            }
+            .model-toggle-item:last-child {
+                border-right: 0;
+            }
+            .model-toggle-item.active {
+                background: #271418;
+                color: #ff5c5c;
+                box-shadow: inset 0 -2px 0 #ff4b4b;
+            }
+            div[data-testid="stSegmentedControl"] {
+                display: none !important;
+            }
             div[data-testid="stRadio"] > div {
                 flex-direction: row;
                 gap: 0.5rem;
             }
             div[data-testid="stRadio"] label {
-                background: #111821;
-                border: 1px solid rgba(255,255,255,0.12);
-                color: #e8edf2;
+                background: #111821 !important;
+                border: 1px solid rgba(255,255,255,0.18) !important;
+                border-radius: 8px !important;
+                color: #e8edf2 !important;
+                padding: 0.45rem 0.85rem !important;
+            }
+            div[data-testid="stRadio"] label:has(input:checked) {
+                background: #271418 !important;
+                border-color: #ff4b4b !important;
+                color: #ff5c5c !important;
+            }
+            div[data-testid="stRadio"] label * {
+                color: inherit !important;
+            }
+            div[data-testid="stRadio"] input {
+                accent-color: #ff4b4b !important;
             }
             div[data-testid="stSegmentedControl"] button,
             div[data-testid="stSegmentedControl"] label,
@@ -301,6 +362,9 @@ def inject_css() -> None:
                 border: 1px solid rgba(255,255,255,0.08);
                 border-radius: 8px;
                 overflow: hidden;
+            }
+            div[data-testid="stDataFrame"] * {
+                color: #e8edf2 !important;
             }
             .stAlert {
                 background: #211419 !important;
@@ -916,6 +980,31 @@ def market_date_rangebreaks(dates) -> list[dict]:
     return [dict(values=missing_dates)] if missing_dates else []
 
 
+def chart_layout(
+    *,
+    height: int,
+    margin: dict,
+    showlegend: bool = True,
+    legend: Optional[dict] = None,
+) -> dict:
+    legend_cfg = {
+        "font": dict(color=CHART_FONT),
+        "title": dict(font=dict(color=CHART_FONT)),
+    }
+    if legend:
+        legend_cfg.update(legend)
+    return {
+        "template": "plotly_dark",
+        "height": height,
+        "margin": margin,
+        "paper_bgcolor": CHART_BG,
+        "plot_bgcolor": CHART_BG,
+        "font": dict(color=CHART_FONT),
+        "legend": legend_cfg,
+        "showlegend": showlegend,
+    }
+
+
 def make_portfolio_chart(agg: pd.DataFrame, primary_fill_mode: str, benchmark_symbol: str) -> go.Figure:
     fig = go.Figure()
     if agg.empty:
@@ -947,25 +1036,23 @@ def make_portfolio_chart(agg: pd.DataFrame, primary_fill_mode: str, benchmark_sy
         )
 
     fig.update_layout(
-        template="plotly_dark",
-        height=350,
-        margin=dict(l=10, r=10, t=10, b=10),
-        paper_bgcolor=CHART_BG,
-        plot_bgcolor=CHART_BG,
-        font=dict(color=CHART_FONT),
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="left",
-            x=0,
-            itemclick=False,
-            itemdoubleclick=False,
+        **chart_layout(
+            height=350,
+            margin=dict(l=10, r=10, t=10, b=10),
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="left",
+                x=0,
+                itemclick=False,
+                itemdoubleclick=False,
+            ),
         ),
         hovermode="x unified",
     )
-    fig.update_xaxes(rangebreaks=market_date_rangebreaks(x), gridcolor=CHART_GRID, zerolinecolor=CHART_GRID)
-    fig.update_yaxes(title_text="Return %")
+    fig.update_xaxes(rangebreaks=market_date_rangebreaks(x), gridcolor=CHART_GRID, zerolinecolor=CHART_GRID, color=CHART_FONT, title_font=dict(color=CHART_FONT))
+    fig.update_yaxes(title_text="Return %", gridcolor=CHART_GRID, zerolinecolor=CHART_GRID, color=CHART_FONT, title_font=dict(color=CHART_FONT))
     return fig
 
 
@@ -1004,17 +1091,16 @@ def make_open_positions_chart(agg: pd.DataFrame) -> go.Figure:
             )
 
     fig.update_layout(
-        template="plotly_dark",
-        height=220,
-        margin=dict(l=10, r=10, t=10, b=10),
-        paper_bgcolor=CHART_BG,
-        plot_bgcolor=CHART_BG,
-        font=dict(color=CHART_FONT),
-        showlegend=pd.notna(avg_exposure),
+        **chart_layout(
+            height=220,
+            margin=dict(l=10, r=10, t=10, b=10),
+            showlegend=pd.notna(avg_exposure),
+            legend=dict(font=dict(color=CHART_FONT)),
+        )
     )
-    fig.update_xaxes(rangebreaks=market_date_rangebreaks(agg[dcol]), gridcolor=CHART_GRID, zerolinecolor=CHART_GRID)
-    fig.update_yaxes(title_text="Positions", range=[0, max(max_reporting, 1)], gridcolor=CHART_GRID, zerolinecolor=CHART_GRID, secondary_y=False)
-    fig.update_yaxes(title_text="Exposure %", range=[0, 100], ticksuffix="%", gridcolor=CHART_GRID, zerolinecolor=CHART_GRID, secondary_y=True)
+    fig.update_xaxes(rangebreaks=market_date_rangebreaks(agg[dcol]), gridcolor=CHART_GRID, zerolinecolor=CHART_GRID, color=CHART_FONT, title_font=dict(color=CHART_FONT))
+    fig.update_yaxes(title_text="Positions", range=[0, max(max_reporting, 1)], gridcolor=CHART_GRID, zerolinecolor=CHART_GRID, color=CHART_FONT, title_font=dict(color=CHART_FONT), secondary_y=False)
+    fig.update_yaxes(title_text="Exposure %", range=[0, 100], ticksuffix="%", gridcolor=CHART_GRID, zerolinecolor=CHART_GRID, color=CHART_FONT, title_font=dict(color=CHART_FONT), secondary_y=True)
     return fig
 
 
@@ -1047,25 +1133,23 @@ def make_symbol_chart(symbol: str, sym_ts: pd.DataFrame, primary_fill_mode: str)
         )
 
     fig.update_layout(
-        template="plotly_dark",
-        height=420,
-        margin=dict(l=10, r=10, t=10, b=10),
-        paper_bgcolor=CHART_BG,
-        plot_bgcolor=CHART_BG,
-        font=dict(color=CHART_FONT),
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="left",
-            x=0,
-            itemclick=False,
-            itemdoubleclick=False,
+        **chart_layout(
+            height=420,
+            margin=dict(l=10, r=10, t=10, b=10),
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="left",
+                x=0,
+                itemclick=False,
+                itemdoubleclick=False,
+            ),
         ),
         hovermode="x unified",
     )
-    fig.update_xaxes(rangebreaks=market_date_rangebreaks(x), gridcolor=CHART_GRID, zerolinecolor=CHART_GRID)
-    fig.update_yaxes(title_text="Equity")
+    fig.update_xaxes(rangebreaks=market_date_rangebreaks(x), gridcolor=CHART_GRID, zerolinecolor=CHART_GRID, color=CHART_FONT, title_font=dict(color=CHART_FONT))
+    fig.update_yaxes(title_text="Equity", gridcolor=CHART_GRID, zerolinecolor=CHART_GRID, color=CHART_FONT, title_font=dict(color=CHART_FONT))
     return fig
 
 
@@ -1105,28 +1189,25 @@ def make_symbol_exposure_chart(symbol: str, sym_ts: pd.DataFrame) -> go.Figure:
         )
 
     fig.update_layout(
-        template="plotly_dark",
-        height=220,
-        margin=dict(l=10, r=10, t=10, b=10),
-        paper_bgcolor=CHART_BG,
-        plot_bgcolor=CHART_BG,
-        font=dict(color=CHART_FONT),
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="left",
-            x=0,
-            itemclick=False,
-            itemdoubleclick=False,
+        **chart_layout(
+            height=220,
+            margin=dict(l=10, r=10, t=10, b=10),
+            showlegend=pd.notna(avg_exposure),
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="left",
+                x=0,
+                itemclick=False,
+                itemdoubleclick=False,
+            ),
         ),
         hovermode="x unified",
-        showlegend=pd.notna(avg_exposure),
     )
-    fig.update_xaxes(rangebreaks=market_date_rangebreaks(sym_ts[dcol]), gridcolor=CHART_GRID, zerolinecolor=CHART_GRID)
-    fig.update_yaxes(title_text="Exposure %", range=[0, 100], ticksuffix="%", gridcolor=CHART_GRID, zerolinecolor=CHART_GRID)
+    fig.update_xaxes(rangebreaks=market_date_rangebreaks(sym_ts[dcol]), gridcolor=CHART_GRID, zerolinecolor=CHART_GRID, color=CHART_FONT, title_font=dict(color=CHART_FONT))
+    fig.update_yaxes(title_text="Exposure %", range=[0, 100], ticksuffix="%", gridcolor=CHART_GRID, zerolinecolor=CHART_GRID, color=CHART_FONT, title_font=dict(color=CHART_FONT))
     return fig
-
 
 def build_attribution_table(filtered: dict) -> pd.DataFrame:
     sym_ts = filtered["symbol_timeseries"]
@@ -1624,17 +1705,7 @@ def render_model_toggle(bundle: dict) -> str:
 
     st.markdown("<div class='model-toggle-label'>Model</div>", unsafe_allow_html=True)
 
-    if hasattr(st, "segmented_control"):
-        selected = st.segmented_control(
-            "Model",
-            options=options,
-            default="ALL SYMBOLS",
-            label_visibility="collapsed",
-            key="model_selector",
-        )
-        return str(selected or "ALL SYMBOLS")
-
-    return st.radio(
+    selected = st.radio(
         "Model",
         options=options,
         index=0,
@@ -1642,6 +1713,7 @@ def render_model_toggle(bundle: dict) -> str:
         label_visibility="collapsed",
         key="model_selector",
     )
+    return str(selected)
 
 
 def main() -> None:
