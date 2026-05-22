@@ -248,11 +248,54 @@ def inject_css() -> None:
                 border: 1px solid rgba(255,255,255,0.12);
                 color: #e8edf2;
             }
+            div[data-testid="stSegmentedControl"] button,
+            div[data-testid="stSegmentedControl"] label,
+            div[data-testid="stSegmentedControl"] [role="radio"] {
+                background: #111821 !important;
+                border-color: rgba(255,255,255,0.18) !important;
+                color: #e8edf2 !important;
+            }
+            div[data-testid="stSegmentedControl"] button[aria-pressed="true"],
+            div[data-testid="stSegmentedControl"] [aria-checked="true"],
+            div[data-testid="stSegmentedControl"] label:has(input:checked) {
+                background: #271418 !important;
+                border-color: #ff4b4b !important;
+                color: #ff5c5c !important;
+            }
+            div[data-testid="stSegmentedControl"] * {
+                color: inherit !important;
+            }
+            div[data-baseweb="select"] > div {
+                background: #111821 !important;
+                border-color: rgba(255,255,255,0.24) !important;
+                color: #e8edf2 !important;
+            }
+            div[data-baseweb="select"] span,
+            div[data-baseweb="select"] svg {
+                color: #e8edf2 !important;
+                fill: #e8edf2 !important;
+            }
             div[data-testid="stDateInput"] input,
             div[data-testid="stTextInput"] input {
                 background: #111821 !important;
                 color: #e8edf2 !important;
                 border-color: rgba(255,255,255,0.16) !important;
+            }
+            div[data-testid="stButton"] button {
+                background: #111821 !important;
+                border: 1px solid rgba(255,255,255,0.24) !important;
+                color: #e8edf2 !important;
+            }
+            div[data-testid="stButton"] button:hover {
+                border-color: #ff4b4b !important;
+                color: #ffffff !important;
+            }
+            div[data-testid="stButton"] button:disabled,
+            div[data-testid="stButton"] button[disabled] {
+                background: #16202b !important;
+                border-color: rgba(255,255,255,0.12) !important;
+                color: rgba(232,237,242,0.56) !important;
+                opacity: 1 !important;
             }
             div[data-testid="stDataFrame"] {
                 border: 1px solid rgba(255,255,255,0.08);
@@ -862,6 +905,17 @@ def render_kpis(metrics: list[tuple[str, str]]) -> None:
         col.markdown(kpi_card(label, value), unsafe_allow_html=True)
 
 
+def market_date_rangebreaks(dates) -> list[dict]:
+    parsed = pd.to_datetime(pd.Series(dates), errors="coerce").dropna().dt.normalize()
+    if parsed.empty:
+        return []
+
+    present_dates = set(parsed.tolist())
+    full_dates = pd.date_range(parsed.min(), parsed.max(), freq="D")
+    missing_dates = [dt for dt in full_dates if dt not in present_dates]
+    return [dict(values=missing_dates)] if missing_dates else []
+
+
 def make_portfolio_chart(agg: pd.DataFrame, primary_fill_mode: str, benchmark_symbol: str) -> go.Figure:
     fig = go.Figure()
     if agg.empty:
@@ -910,7 +964,7 @@ def make_portfolio_chart(agg: pd.DataFrame, primary_fill_mode: str, benchmark_sy
         ),
         hovermode="x unified",
     )
-    fig.update_xaxes(gridcolor=CHART_GRID, zerolinecolor=CHART_GRID)
+    fig.update_xaxes(rangebreaks=market_date_rangebreaks(x), gridcolor=CHART_GRID, zerolinecolor=CHART_GRID)
     fig.update_yaxes(title_text="Return %")
     return fig
 
@@ -958,7 +1012,7 @@ def make_open_positions_chart(agg: pd.DataFrame) -> go.Figure:
         font=dict(color=CHART_FONT),
         showlegend=pd.notna(avg_exposure),
     )
-    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], gridcolor=CHART_GRID, zerolinecolor=CHART_GRID)
+    fig.update_xaxes(rangebreaks=market_date_rangebreaks(agg[dcol]), gridcolor=CHART_GRID, zerolinecolor=CHART_GRID)
     fig.update_yaxes(title_text="Positions", range=[0, max(max_reporting, 1)], gridcolor=CHART_GRID, zerolinecolor=CHART_GRID, secondary_y=False)
     fig.update_yaxes(title_text="Exposure %", range=[0, 100], ticksuffix="%", gridcolor=CHART_GRID, zerolinecolor=CHART_GRID, secondary_y=True)
     return fig
@@ -1010,7 +1064,7 @@ def make_symbol_chart(symbol: str, sym_ts: pd.DataFrame, primary_fill_mode: str)
         ),
         hovermode="x unified",
     )
-    fig.update_xaxes(gridcolor=CHART_GRID, zerolinecolor=CHART_GRID)
+    fig.update_xaxes(rangebreaks=market_date_rangebreaks(x), gridcolor=CHART_GRID, zerolinecolor=CHART_GRID)
     fig.update_yaxes(title_text="Equity")
     return fig
 
@@ -1069,7 +1123,7 @@ def make_symbol_exposure_chart(symbol: str, sym_ts: pd.DataFrame) -> go.Figure:
         hovermode="x unified",
         showlegend=pd.notna(avg_exposure),
     )
-    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], gridcolor=CHART_GRID, zerolinecolor=CHART_GRID)
+    fig.update_xaxes(rangebreaks=market_date_rangebreaks(sym_ts[dcol]), gridcolor=CHART_GRID, zerolinecolor=CHART_GRID)
     fig.update_yaxes(title_text="Exposure %", range=[0, 100], ticksuffix="%", gridcolor=CHART_GRID, zerolinecolor=CHART_GRID)
     return fig
 
